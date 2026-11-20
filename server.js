@@ -1,3 +1,4 @@
+
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -11,6 +12,7 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const HOST = "0.0.0.0";
 
 const TURSO_DATABASE_URL = process.env.TURSO_DATABASE_URL;
 const TURSO_AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN;
@@ -28,7 +30,15 @@ const db = createClient({
   authToken: TURSO_AUTH_TOKEN,
 });
 
-app.use(cors());
+const corsOptions = {
+  origin: true,
+  methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-admin-key", "X-Admin-Key"],
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
 app.use(express.json({ limit: "25mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -385,6 +395,10 @@ function sanitizeUser(u) {
   copy.is_suspended = Boolean(copy.is_suspended);
   return copy;
 }
+
+app.get("/ping", (req, res) => {
+  res.status(200).send("ok");
+});
 
 app.get("/health", (req, res) => {
   res.json({
@@ -1091,18 +1105,36 @@ app.put("/api/listings/:id", async (req, res) => {
 
 app.patch("/api/listings/:id/status", async (req, res) => {
   try {
-    const { status } = req.body;
-    if (!["active", "paused"].includes(status)) {
-      return res.status(400).json({ error: "Status must be active or paused." });
+    const rawStatus = String(req.body?.status || req.body?.action || "").toLowerCase().trim();
+    const nextStatus =
+      rawStatus === "unpause" || rawStatus === "resume" || rawStatus === "active"
+        ? "active"
+        : rawStatus === "pause" || rawStatus === "paused"
+          ? "paused"
+          : null;
+
+    if (!nextStatus) {
+      return res.status(400).json({ error: "Status must be active/unpause or paused/pause." });
     }
+
+    const existingRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] });
+    const existing = rowToObj(existingRes);
+    if (!existing) return res.status(404).json({ error: "Listing not found." });
+
+    const nowIso = new Date().toISOString();
+    const publishedAt = nextStatus === "active" ? (existing.published_at || nowIso) : existing.published_at;
+
     await db.execute({
-      sql: "UPDATE listings SET status = ?, updated_at = ? WHERE id = ?",
-      args: [status, new Date().toISOString(), req.params.id],
+      sql: "UPDATE listings SET status = ?, published_at = ?, updated_at = ? WHERE id = ?",
+      args: [nextStatus, publishedAt, nowIso, existing.id],
     });
-    const updatedRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] });
+
+    const updatedRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [existing.id] });
     const updated = rowToObj(updatedRes);
-    if (!updated) return res.status(404).json({ error: "Listing not found." });
-    res.json({ listing: updated });
+    res.json({
+      message: nextStatus === "paused" ? "Listing paused." : "Listing unpaused and active.",
+      listing: { ...updated, days_remaining: computeDaysRemaining(updated) },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1337,13 +1369,13 @@ app.delete("/api/admin/dealers/:id", requireAdmin, async (req, res) => {
 
 app.post("/api/admin/listings/:id/moderate", requireAdmin, async (req, res) => {
   try {
-    const { action } = req.body;
+    const action = String(req.body?.action || "").toLowerCase().trim();
     const listRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] });
     const listing = rowToObj(listRes);
     if (!listing) return res.status(404).json({ error: "Listing not found." });
 
     const nowIso = new Date().toISOString();
-    if (action === "approve" || action === "mark_safe" || action === "unpause") {
+    if (action === "approve" || action === "mark_safe" || action === "unpause" || action === "resume") {
       const pubAt = listing.published_at || nowIso;
       await db.execute({
         sql: "UPDATE listings SET status = 'active', report_reason = NULL, published_at = ?, updated_at = ? WHERE id = ?",
@@ -1359,7 +1391,11 @@ app.post("/api/admin/listings/:id/moderate", requireAdmin, async (req, res) => {
     }
 
     const updatedRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [listing.id] });
-    res.json({ listing: rowToObj(updatedRes) });
+    const updated = rowToObj(updatedRes);
+    res.json({
+      message: `Listing updated to ${updated.status}.`,
+      listing: { ...updated, days_remaining: computeDaysRemaining(updated) },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1367,8 +1403,12 @@ app.post("/api/admin/listings/:id/moderate", requireAdmin, async (req, res) => {
 
 app.post("/api/admin/users/:id/gift-posts", requireAdmin, async (req, res) => {
   try {
-    const count = Number(req.body.posts_count || 0);
-    if (!count) return res.status(400).json({ error: "posts_count required." });
+    const rawCount =
+      req.body?.posts_count ?? req.body?.postsCount ?? req.body?.posts ?? req.body?.credits ?? req.body?.count;
+    const count = Number(rawCount);
+    if (!Number.isFinite(count) || count === 0) {
+      return res.status(400).json({ error: "Valid non-zero posts_count is required." });
+    }
 
     const userRes = await db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [req.params.id] });
     const user = rowToObj(userRes);
@@ -1377,7 +1417,12 @@ app.post("/api/admin/users/:id/gift-posts", requireAdmin, async (req, res) => {
     const newCredits = Math.max(0, Number(user.paid_post_credits || 0) + count);
     await db.execute({ sql: "UPDATE users SET paid_post_credits = ? WHERE id = ?", args: [newCredits, user.id] });
     await addSellerNotification(user.id, `Admin gifted ${count} post credit(s) to your account.`);
-    res.json({ message: "Gifted posts updated." });
+
+    const updatedRes = await db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [user.id] });
+    res.json({
+      message: `Gifted ${count} post credit(s) to ${user.name}.`,
+      user: sanitizeUser(rowToObj(updatedRes)),
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1467,8 +1512,8 @@ app.post("/api/admin/catalog", requireAdmin, async (req, res) => {
 
 initDb()
   .then(() => {
-    app.listen(PORT, () => {
-      console.log(`Wariara Cars Central Rift API (Turso) running on port ${PORT}`);
+    app.listen(PORT, HOST, () => {
+      console.log(`Wariara Cars Central Rift API (Turso) running on http://${HOST}:${PORT}`);
     });
   })
   .catch((err) => {

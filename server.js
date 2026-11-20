@@ -16,6 +16,8 @@ app.use(express.json({ limit: "15mb" }));
 
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "wariara_admin_2026";
 const PAID_POST_LIFETIME_DAYS = 70;
+const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || "service_39pgd3j";
+const EMAILJS_TEMPLATE_ID = process.env.EMAILJS_TEMPLATE_ID || "template_euj4t1e";
 
 const db = createClient({
   url: process.env.TURSO_DATABASE_URL,
@@ -63,20 +65,50 @@ function computeRemainingDays(expiresAt) {
   return Math.max(0, Math.ceil(diffMs / (24 * 3600 * 1000)));
 }
 
+function normalizeKenyanPhone(phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  if (digits.startsWith("0") && digits.length === 10) return `254${digits.slice(1)}`;
+  if (digits.startsWith("7") && digits.length === 9) return `254${digits}`;
+  if (digits.startsWith("2540") && digits.length === 13) return `254${digits.slice(4)}`;
+  if (digits.startsWith("254") && digits.length === 12) return digits;
+  return String(phone || "").trim();
+}
+
+function phoneRegistryKey(phone) {
+  return normalizeKenyanPhone(phone).replace(/\D/g, "");
+}
+
+function optionalText(value) {
+  const text = String(value ?? "").trim();
+  return text || null;
+}
+
+function optionalNumber(value) {
+  if (value === undefined || value === null || String(value).trim() === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
 function enrichListing(row) {
   const isExpiredByTime = Boolean(row.expires_at && new Date(row.expires_at).getTime() <= Date.now());
   const effectiveStatus = isExpiredByTime && row.status !== "unsafe_removed" ? "expired" : row.status;
+  const priorityExpiresAt = row.priority_expires_at ? new Date(row.priority_expires_at) : null;
+  const priorityRemainingHours = priorityExpiresAt && priorityExpiresAt.getTime() > Date.now()
+    ? Math.ceil((priorityExpiresAt.getTime() - Date.now()) / (60 * 60 * 1000))
+    : 0;
   return {
     ...row,
     status: effectiveStatus,
     days_remaining: row.expires_at ? computeRemainingDays(row.expires_at) : null,
+    is_prioritized: priorityRemainingHours > 0 && Number(row.priority_amount_kes) > 0,
+    priority_remaining_hours: priorityRemainingHours,
   };
 }
 
 async function expireOverdueListings() {
   await db.execute({
     sql: `UPDATE listings
-          SET status = 'expired', priority_amount_kes = 0, priority_expires_at = NULL
+          SET status = 'expired', priority_amount_kes = 0, priority_expires_at = NULL, priority_plan_name = NULL
           WHERE expires_at IS NOT NULL
             AND expires_at <= CURRENT_TIMESTAMP
             AND status NOT IN ('expired', 'unsafe_removed')`,
@@ -135,6 +167,7 @@ async function ensureUsersAndListingsColumns() {
       ["suspension_reason", "TEXT"],
       ["appeal_text", "TEXT"],
       ["appeal_status", "TEXT DEFAULT 'none'"],
+      ["agent_of", "TEXT"],
     ];
     for (const [colName, colDef] of columnsToAdd) {
       if (!existingCols.has(colName)) {
@@ -154,6 +187,21 @@ async function ensureUsersAndListingsColumns() {
     if (!existingListCols.has("expires_at")) {
       await db.execute(`ALTER TABLE listings ADD COLUMN expires_at DATETIME`);
     }
+    if (!existingListCols.has("priority_plan_name")) {
+      await db.execute(`ALTER TABLE listings ADD COLUMN priority_plan_name TEXT`);
+    }
+    if (!existingListCols.has("whatsapp_phone")) {
+      await db.execute(`ALTER TABLE listings ADD COLUMN whatsapp_phone TEXT`);
+    }
+    if (!existingListCols.has("call_phone")) {
+      await db.execute(`ALTER TABLE listings ADD COLUMN call_phone TEXT`);
+    }
+  }
+
+  const resetInfo = await db.execute(`PRAGMA table_info(password_resets)`);
+  const resetCols = new Set(resetInfo.rows.map((row) => String(row.name)));
+  if (!resetCols.has("attempts")) {
+    await db.execute(`ALTER TABLE password_resets ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`);
   }
 }
 
@@ -178,6 +226,7 @@ async function initDatabase() {
       suspension_reason TEXT,
       appeal_text TEXT,
       appeal_status TEXT DEFAULT 'none',
+      agent_of TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`,
     `CREATE TABLE IF NOT EXISTS password_resets (
@@ -186,7 +235,12 @@ async function initDatabase() {
       token_hash TEXT UNIQUE NOT NULL,
       expires_at DATETIME NOT NULL,
       used_at DATETIME,
+      attempts INTEGER NOT NULL DEFAULT 0,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS whatsapp_phone_registry (
+      phone_key TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL
     )`,
     `CREATE TABLE IF NOT EXISTS seller_notifications (
       id TEXT PRIMARY KEY,
@@ -210,6 +264,13 @@ async function initDatabase() {
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       post_count INTEGER NOT NULL,
+      price_kes INTEGER NOT NULL,
+      active INTEGER DEFAULT 1
+    )`,
+    `CREATE TABLE IF NOT EXISTS priority_plans (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      duration_hours INTEGER NOT NULL,
       price_kes INTEGER NOT NULL,
       active INTEGER DEFAULT 1
     )`,
@@ -294,6 +355,14 @@ async function initDatabase() {
     args: [],
   });
 
+  const priorityPlanCount = await db.execute(`SELECT COUNT(*) AS cnt FROM priority_plans`);
+  if (Number(priorityPlanCount.rows[0].cnt) === 0) {
+    await db.execute({
+      sql: `INSERT INTO priority_plans (id, name, duration_hours, price_kes) VALUES (?, ?, ?, ?)`,
+      args: [crypto.randomUUID(), "24 Hours", 24, 300],
+    });
+  }
+
   const plansCnt = await db.execute(`SELECT COUNT(*) AS cnt FROM post_plans`);
   if (Number(plansCnt.rows[0].cnt) === 0) {
     await db.execute({
@@ -361,6 +430,18 @@ async function initDatabase() {
         "https://images.unsplash.com/photo-1549317661-bd32c8ce0db2?auto=format&fit=crop&w=900&q=75",
       ],
     });
+  }
+
+  await db.execute(`DELETE FROM whatsapp_phone_registry`);
+  const usersForPhoneRegistry = await db.execute(`SELECT id, whatsapp_phone FROM users WHERE whatsapp_phone != ''`);
+  for (const user of serializeRows(usersForPhoneRegistry.rows)) {
+    const phoneKey = phoneRegistryKey(user.whatsapp_phone);
+    if (phoneKey) {
+      await db.execute({
+        sql: `INSERT OR IGNORE INTO whatsapp_phone_registry (phone_key, user_id) VALUES (?, ?)`,
+        args: [phoneKey, user.id],
+      });
+    }
   }
 }
 
@@ -438,6 +519,17 @@ app.post("/api/sellers/account", async (req, res) => {
       });
     }
 
+    const normalizedWhatsApp = normalizeKenyanPhone(whatsapp_phone);
+    const phoneKey = phoneRegistryKey(normalizedWhatsApp);
+    if (!phoneKey) return res.status(400).json({ error: "Enter a valid WhatsApp number." });
+    const registeredPhone = await db.execute({
+      sql: `SELECT user_id FROM whatsapp_phone_registry WHERE phone_key = ?`,
+      args: [phoneKey],
+    });
+    if (registeredPhone.rows.length > 0) {
+      return res.status(409).json({ error: "This WhatsApp number is already used by another account." });
+    }
+
     const id = crypto.randomUUID();
     const safeRole = role === "dealer" ? "dealer" : "private";
     const slug =
@@ -449,24 +541,44 @@ app.post("/api/sellers/account", async (req, res) => {
       id.slice(0, 4);
     const passwordHash = hashPassword(password);
 
-    await db.execute({
-      sql: `INSERT INTO users (id, name, phone, email, password_hash, whatsapp_phone, call_phone, role, shop_slug, town)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      args: [
-        id,
-        name.trim(),
-        cleanPhone,
-        cleanEmail,
-        passwordHash,
-        whatsapp_phone.trim(),
-        call_phone.trim(),
-        safeRole,
-        slug,
-        town,
-      ],
-    });
+    try {
+      await db.execute({
+        sql: `INSERT INTO whatsapp_phone_registry (phone_key, user_id) VALUES (?, ?)`,
+        args: [phoneKey, id],
+      });
+    } catch (err) {
+      if (String(err.message).includes("UNIQUE constraint failed")) {
+        return res.status(409).json({ error: "This WhatsApp number is already used by another account." });
+      }
+      throw err;
+    }
 
-    await addSellerNotification(id, "Account created. You have 6 free posts available (max 6 photos each).");
+    try {
+      await db.execute({
+        sql: `INSERT INTO users (id, name, phone, email, password_hash, whatsapp_phone, call_phone, role, shop_slug, town)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          id,
+          name.trim(),
+          cleanPhone,
+          cleanEmail,
+          passwordHash,
+          normalizedWhatsApp,
+          call_phone.trim(),
+          safeRole,
+          slug,
+          town,
+        ],
+      });
+    } catch (err) {
+      await db.execute({
+        sql: `DELETE FROM whatsapp_phone_registry WHERE phone_key = ? AND user_id = ?`,
+        args: [phoneKey, id],
+      });
+      throw err;
+    }
+
+    await addSellerNotification(id, "Account created. You have 6 free posts available.");
     const created = await db.execute({ sql: `SELECT * FROM users WHERE id = ?`, args: [id] });
     res.status(201).json({ user: sanitizeUser(serializeRows(created.rows)[0]) });
   } catch (err) {
@@ -498,14 +610,15 @@ app.post("/api/sellers/login", async (req, res) => {
   }
 });
 
-// Creates a single-use reset token for EmailJS to send to the seller's email
-app.post("/api/sellers/forgot-password/token", async (req, res) => {
+app.post("/api/sellers/forgot-password/code", async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: "Enter your account email address." });
     const cleanEmail = email.trim().toLowerCase();
     const r = await db.execute({ sql: `SELECT * FROM users WHERE email = ?`, args: [cleanEmail] });
-    if (r.rows.length === 0) return res.status(404).json({ error: "No seller account found with that email." });
+    if (r.rows.length === 0) {
+      return res.json({ message: "If an account exists for that email, a reset code has been sent." });
+    }
     const user = serializeRows(r.rows)[0];
 
     await db.execute({
@@ -513,27 +626,124 @@ app.post("/api/sellers/forgot-password/token", async (req, res) => {
       args: [user.id],
     });
 
-    const rawToken = crypto.randomBytes(32).toString("hex");
-    const tokenHash = hashToken(rawToken);
-    const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+    const resetCode = String(crypto.randomInt(100000, 1000000));
+    const tokenHash = hashToken(resetCode);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
     await db.execute({
       sql: `INSERT INTO password_resets (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)`,
       args: [crypto.randomUUID(), user.id, tokenHash, expiresAt],
     });
 
-    res.json({
-      token: rawToken,
-      email: cleanEmail,
-      name: user.name,
-      expires_at: expiresAt,
+    const publicKey = process.env.EMAILJS_PUBLIC_KEY;
+    const privateKey = process.env.EMAILJS_PRIVATE_KEY;
+    if (!publicKey || !privateKey) {
+      await db.execute({
+        sql: `UPDATE password_resets SET used_at = CURRENT_TIMESTAMP WHERE token_hash = ? AND used_at IS NULL`,
+        args: [tokenHash],
+      });
+      return res.status(503).json({ error: "Password reset email is not configured. Please contact support." });
+    }
+
+    const mailResponse = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        service_id: EMAILJS_SERVICE_ID,
+        template_id: EMAILJS_TEMPLATE_ID,
+        user_id: publicKey,
+        accessToken: privateKey,
+        template_params: {
+          to_email: cleanEmail,
+          to_name: user.name,
+          name: "Wariara Cars Central Rift",
+          from_name: "Wariara Cars Central Rift",
+          subject: "Your Wariara Cars password reset code",
+          message: `Your password reset code is ${resetCode}. It is valid for 10 minutes. If you did not request this, you can ignore this email.`,
+          reset_code: resetCode,
+          code_expiry_minutes: "10",
+        },
+      }),
     });
+    if (!mailResponse.ok) {
+      const providerMessage = await mailResponse.text();
+      await db.execute({
+        sql: `UPDATE password_resets SET used_at = CURRENT_TIMESTAMP WHERE token_hash = ? AND used_at IS NULL`,
+        args: [tokenHash],
+      });
+      console.error("Password reset email delivery failed:", mailResponse.status, providerMessage);
+      return res.status(502).json({ error: "Could not send the reset email. Please try again later." });
+    }
+
+    res.json({ message: "If an account exists for that email, a 6-digit reset code has been sent. It expires in 10 minutes." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Consumes token once so it can never be reused
+app.post("/api/sellers/forgot-password/verify", async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) return res.status(400).json({ error: "Enter your account email and reset code." });
+    const userResult = await db.execute({
+      sql: `SELECT id FROM users WHERE email = ?`,
+      args: [String(email).trim().toLowerCase()],
+    });
+    if (userResult.rows.length === 0) return res.status(400).json({ error: "Invalid or expired reset code." });
+
+    const userId = String(userResult.rows[0].id);
+    const resetResult = await db.execute({
+      sql: `SELECT * FROM password_resets WHERE user_id = ? AND used_at IS NULL ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      args: [userId],
+    });
+    if (resetResult.rows.length === 0) return res.status(400).json({ error: "Invalid or expired reset code." });
+    const reset = serializeRows(resetResult.rows)[0];
+    if (Number(reset.attempts) >= 5 || new Date(reset.expires_at).getTime() <= Date.now()) {
+      await db.execute({
+        sql: `UPDATE password_resets SET used_at = CURRENT_TIMESTAMP WHERE id = ? AND used_at IS NULL`,
+        args: [reset.id],
+      });
+      return res.status(400).json({ error: "Invalid or expired reset code. Request a new code." });
+    }
+
+    const submittedHash = hashToken(String(code).trim());
+    const expectedHash = Buffer.from(String(reset.token_hash), "hex");
+    const actualHash = Buffer.from(submittedHash, "hex");
+    if (expectedHash.length !== actualHash.length || !crypto.timingSafeEqual(expectedHash, actualHash)) {
+      await db.execute({
+        sql: `UPDATE password_resets SET attempts = attempts + 1,
+              used_at = CASE WHEN attempts + 1 >= 5 THEN CURRENT_TIMESTAMP ELSE used_at END
+              WHERE id = ? AND used_at IS NULL`,
+        args: [reset.id],
+      });
+      return res.status(400).json({ error: "Invalid or expired reset code." });
+    }
+
+    const consumed = await db.execute({
+      sql: `UPDATE password_resets SET used_at = CURRENT_TIMESTAMP WHERE id = ? AND used_at IS NULL AND attempts < 5`,
+      args: [reset.id],
+    });
+    if (Number(consumed.rowsAffected || 0) === 0) {
+      return res.status(400).json({ error: "Invalid or expired reset code." });
+    }
+
+    const resetToken = crypto.randomBytes(32).toString("hex");
+    await db.execute({
+      sql: `INSERT INTO password_resets (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)`,
+      args: [
+        crypto.randomUUID(),
+        userId,
+        hashToken(resetToken),
+        new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+      ],
+    });
+    res.json({ reset_token: resetToken });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Consumes the verified reset token once so it can never be reused.
 app.post("/api/sellers/reset-password", async (req, res) => {
   try {
     const { token, password, confirm_password } = req.body;
@@ -545,14 +755,14 @@ app.post("/api/sellers/reset-password", async (req, res) => {
 
     const tokenHash = hashToken(String(token).trim());
     const r = await db.execute({ sql: `SELECT * FROM password_resets WHERE token_hash = ?`, args: [tokenHash] });
-    if (r.rows.length === 0) return res.status(400).json({ error: "Invalid password reset link." });
+    if (r.rows.length === 0) return res.status(400).json({ error: "Invalid password reset token." });
 
     const resetRow = serializeRows(r.rows)[0];
     if (resetRow.used_at) {
-      return res.status(400).json({ error: "This reset link has already been used and cannot be used again." });
+      return res.status(400).json({ error: "This reset token has already been used and cannot be reused." });
     }
-    if (new Date(resetRow.expires_at).getTime() < Date.now()) {
-      return res.status(400).json({ error: "This reset link has expired. Request a new one." });
+    if (new Date(resetRow.expires_at).getTime() <= Date.now()) {
+      return res.status(400).json({ error: "This reset token has expired. Request a new code." });
     }
 
     const consumed = await db.execute({
@@ -560,7 +770,7 @@ app.post("/api/sellers/reset-password", async (req, res) => {
       args: [resetRow.id],
     });
     if (Number(consumed.rowsAffected || 0) === 0) {
-      return res.status(400).json({ error: "This reset link has already been used." });
+      return res.status(400).json({ error: "This reset token has already been used." });
     }
 
     await db.execute({
@@ -570,7 +780,7 @@ app.post("/api/sellers/reset-password", async (req, res) => {
 
     const updated = await db.execute({ sql: `SELECT * FROM users WHERE id = ?`, args: [resetRow.user_id] });
     res.json({
-      message: "Password updated! This reset link has now been used and cannot be reused.",
+      message: "Password updated successfully. This reset token cannot be reused.",
       user: sanitizeUser(serializeRows(updated.rows)[0]),
     });
   } catch (err) {
@@ -635,18 +845,22 @@ app.get("/api/sellers/:id/listings", async (req, res) => {
 });
 
 // ==========================================
-// PUBLIC MARKETPLACE & PRIORITY API (ONLY ADMIN-APPROVED ACTIVE POSTS)
+// PUBLIC MARKETPLACE & PRIORITY API (APPROVED AVAILABLE POSTS)
 // ==========================================
 app.get("/api/meta", async (req, res) => {
   try {
     const catalog = await db.execute(`SELECT * FROM vehicle_catalog ORDER BY brand ASC, model ASC`);
     const plans = await db.execute(`SELECT * FROM post_plans WHERE active = 1 ORDER BY price_kes ASC`);
+    const priorityPlans = await db.execute(
+      `SELECT * FROM priority_plans WHERE active = 1 ORDER BY duration_hours ASC, price_kes ASC`
+    );
     const settingsRows = await db.execute(`SELECT * FROM settings`);
     const settings = {};
     for (const r of settingsRows.rows) settings[r.key] = r.value;
     res.json({
       catalog: serializeRows(catalog.rows),
       plans: serializeRows(plans.rows),
+      priorityPlans: serializeRows(priorityPlans.rows),
       settings,
     });
   } catch (err) {
@@ -660,33 +874,28 @@ app.get("/api/priority/leaderboard", async (req, res) => {
     const settings = {};
     for (const r of settingsRows.rows) settings[r.key] = Number(r.value);
 
-    const maxSlots = settings.max_daily_priority_slots || 20;
     const baseFee = settings.base_priority_price_kes || 300;
 
     const slotsRes = await db.execute({
-      sql: `SELECT l.id, l.title, l.category, l.priority_amount_kes, l.priority_expires_at, u.name AS seller_name
+      sql: `SELECT l.id, l.title, l.category, l.priority_amount_kes, l.priority_expires_at,
+                   l.priority_plan_name, u.name AS seller_name
             FROM listings l
             JOIN users u ON u.id = l.seller_id
             WHERE l.status = 'active' AND u.is_suspended = 0
               AND (l.expires_at IS NULL OR l.expires_at > CURRENT_TIMESTAMP)
               AND l.priority_amount_kes > 0 AND l.priority_expires_at > CURRENT_TIMESTAMP
-            ORDER BY l.priority_amount_kes DESC, l.created_at DESC
-            LIMIT ?`,
-      args: [maxSlots],
+            ORDER BY l.priority_amount_kes DESC, l.priority_expires_at DESC, l.created_at DESC`,
+      args: [],
     });
 
     const slots = serializeRows(slotsRes.rows);
     const highestBid = slots.length > 0 ? slots[0].priority_amount_kes : 0;
-    const lowestSlot = slots.length >= maxSlots ? slots[slots.length - 1].priority_amount_kes : 0;
-    const minToEnter = slots.length >= maxSlots ? Math.max(baseFee, lowestSlot + 50) : baseFee;
 
     res.json({
       baseFee,
-      maxSlots,
       usedSlots: slots.length,
       highestBid,
-      minToEnter,
-      recommendedForTop1: Math.max(baseFee, highestBid + 50),
+      recommendedForTop1: baseFee,
       leaderboard: slots,
     });
   } catch (err) {
@@ -811,11 +1020,12 @@ app.get("/api/listings", async (req, res) => {
     const sql = `
       WITH ranked AS (
         SELECT l.*, u.name AS seller_name, u.role AS seller_role, u.shop_slug AS seller_slug,
-               u.whatsapp_phone, u.call_phone,
+               COALESCE(NULLIF(l.whatsapp_phone, ''), u.whatsapp_phone) AS effective_whatsapp_phone,
+               COALESCE(NULLIF(l.call_phone, ''), u.call_phone) AS effective_call_phone,
                (SELECT photo_data FROM listing_photos p WHERE p.listing_id = l.id ORDER BY p.sort_order ASC LIMIT 1) AS cover_photo,
                (SELECT COUNT(*) FROM listing_photos p WHERE p.listing_id = l.id) AS photo_count,
-               CASE WHEN l.priority_amount_kes > 0 AND l.priority_expires_at > CURRENT_TIMESTAMP THEN 1 ELSE 0 END AS is_sponsored,
-               CASE WHEN l.priority_amount_kes > 0 AND l.priority_expires_at > CURRENT_TIMESTAMP THEN l.priority_amount_kes ELSE 0 END AS effective_priority,
+               CASE WHEN l.status = 'active' AND l.priority_amount_kes > 0 AND l.priority_expires_at > CURRENT_TIMESTAMP THEN 1 ELSE 0 END AS is_sponsored,
+               CASE WHEN l.status = 'active' AND l.priority_amount_kes > 0 AND l.priority_expires_at > CURRENT_TIMESTAMP THEN l.priority_amount_kes ELSE 0 END AS effective_priority,
                ROW_NUMBER() OVER (PARTITION BY l.seller_id ORDER BY l.created_at DESC) AS seller_slot
         FROM listings l
         JOIN users u ON u.id = l.seller_id
@@ -824,7 +1034,14 @@ app.get("/api/listings", async (req, res) => {
       SELECT * FROM ranked l ORDER BY ${orderBy} LIMIT 100
     `;
     const rows = await db.execute({ sql, args });
-    res.json({ listings: serializeRows(rows.rows).map(enrichListing) });
+    const listings = serializeRows(rows.rows).map((row) => {
+      row.whatsapp_phone = row.effective_whatsapp_phone;
+      row.call_phone = row.effective_call_phone;
+      delete row.effective_whatsapp_phone;
+      delete row.effective_call_phone;
+      return enrichListing(row);
+    });
+    res.json({ listings });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -834,12 +1051,19 @@ app.get("/api/listings/:id", async (req, res) => {
   try {
     const r = await db.execute({
       sql: `SELECT l.*, u.name AS seller_name, u.role AS seller_role, u.shop_slug AS seller_slug,
-                   u.whatsapp_phone, u.call_phone, u.town AS seller_town
+                   COALESCE(NULLIF(l.whatsapp_phone, ''), u.whatsapp_phone) AS effective_whatsapp_phone,
+                   COALESCE(NULLIF(l.call_phone, ''), u.call_phone) AS effective_call_phone,
+                   u.town AS seller_town
             FROM listings l JOIN users u ON u.id = l.seller_id WHERE l.id = ?`,
       args: [req.params.id],
     });
     if (r.rows.length === 0) return res.status(404).json({ error: "Not found" });
-    const listing = enrichListing(serializeRows(r.rows)[0]);
+    const listingRow = serializeRows(r.rows)[0];
+    listingRow.whatsapp_phone = listingRow.effective_whatsapp_phone;
+    listingRow.call_phone = listingRow.effective_call_phone;
+    delete listingRow.effective_whatsapp_phone;
+    delete listingRow.effective_call_phone;
+    const listing = enrichListing(listingRow);
     const photos = await db.execute({
       sql: `SELECT id, photo_data, sort_order FROM listing_photos WHERE listing_id = ? ORDER BY sort_order ASC`,
       args: [req.params.id],
@@ -957,51 +1181,17 @@ app.post("/api/listings", async (req, res) => {
     }
 
     const category = b.category === "part" ? "part" : "motor";
-    const priceNum = Number(b.price_kes);
-    const town = String(b.town || "").trim();
+    const priceNum = optionalNumber(b.price_kes) ?? 0;
+    const town = String(b.town || seller.town || "").trim();
     const description = String(b.description || "").trim();
 
-    if (!priceNum || priceNum <= 0 || !town || !description) {
-      return res.status(400).json({ error: "Price, location, and description are required." });
-    }
-
-    if (category === "motor") {
-      const requiredMotor = [
-        b.vehicle_type,
-        b.condition_type,
-        b.brand,
-        b.model,
-        b.body_type,
-        b.year,
-        b.reg_number,
-        b.fuel_type,
-        b.transmission,
-        b.drive_type,
-        b.air_con,
-        b.engine_cc,
-        b.mileage_km,
-      ];
-      if (requiredMotor.some((v) => v === undefined || v === null || String(v).trim() === "")) {
-        return res.status(400).json({ error: "Please fill in all motor fields before submitting." });
-      }
-    } else {
-      const requiredPart = [
-        b.part_name,
-        b.part_make,
-        b.part_model,
-        b.year_from,
-        b.year_to,
-        b.part_condition,
-        b.part_authenticity,
-      ];
-      if (requiredPart.some((v) => v === undefined || v === null || String(v).trim() === "")) {
-        return res.status(400).json({ error: "Please fill in all spare part fields before submitting." });
-      }
-    }
+    if (!description) return res.status(400).json({ error: "A description is required." });
+    if (priceNum < 0) return res.status(400).json({ error: "Price cannot be negative." });
 
     const photos = Array.isArray(b.photos) ? b.photos : [];
-    if (photos.length === 0) return res.status(400).json({ error: "At least 1 photo is required." });
-    if (photos.length > 6) return res.status(400).json({ error: "Maximum 6 photos allowed per post." });
+    if (photos.some((photo) => typeof photo !== "string")) {
+      return res.status(400).json({ error: "Listing photos must be image data." });
+    }
 
     const useFreePost = freeLeft > 0;
     const expiresAt = useFreePost
@@ -1011,8 +1201,9 @@ app.post("/api/listings", async (req, res) => {
     const id = crypto.randomUUID();
     const title =
       category === "motor"
-        ? `${b.year} ${b.brand} ${b.model}`.trim()
-        : `${b.part_name} (${b.part_make} ${b.part_model})`.trim();
+        ? [optionalText(b.year), optionalText(b.brand), optionalText(b.model)].filter(Boolean).join(" ") || "Motor listing"
+        : [optionalText(b.part_name), optionalText(b.part_make), optionalText(b.part_model)].filter(Boolean).join(" ") ||
+          "Spare parts listing";
 
     await db.execute({
       sql: `INSERT INTO listings (
@@ -1020,8 +1211,12 @@ app.post("/api/listings", async (req, res) => {
         vehicle_type, reg_number, condition_type, brand, model, body_type, year,
         fuel_type, transmission, drive_type, air_con, engine_cc, mileage_km,
         part_name, part_make, part_model, year_from, year_to, part_condition, part_authenticity,
-        is_paid_post, expires_at, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval')`,
+        whatsapp_phone, call_phone, is_paid_post, expires_at, status
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        'pending_approval'
+      )`,
       args: [
         id,
         seller.id,
@@ -1031,26 +1226,28 @@ app.post("/api/listings", async (req, res) => {
         b.negotiable === "No" ? "No" : "Yes",
         town,
         description,
-        category === "motor" ? String(b.vehicle_type).trim() : null,
-        category === "motor" ? String(b.reg_number).trim() : null,
-        category === "motor" ? String(b.condition_type).trim() : null,
-        category === "motor" ? String(b.brand).trim() : null,
-        category === "motor" ? String(b.model).trim() : null,
-        category === "motor" ? String(b.body_type).trim() : null,
-        category === "motor" ? Number(b.year) : null,
-        category === "motor" ? String(b.fuel_type).trim() : null,
-        category === "motor" ? String(b.transmission).trim() : null,
-        category === "motor" ? String(b.drive_type).trim() : null,
-        category === "motor" ? String(b.air_con).trim() : null,
-        category === "motor" ? Number(b.engine_cc) : null,
-        category === "motor" ? Number(b.mileage_km) : null,
-        category === "part" ? String(b.part_name).trim() : null,
-        category === "part" ? String(b.part_make).trim() : null,
-        category === "part" ? String(b.part_model).trim() : null,
-        category === "part" ? Number(b.year_from) : null,
-        category === "part" ? Number(b.year_to) : null,
-        category === "part" ? String(b.part_condition).trim() : null,
-        category === "part" ? String(b.part_authenticity).trim() : null,
+        category === "motor" ? optionalText(b.vehicle_type) : null,
+        category === "motor" ? optionalText(b.reg_number) : null,
+        category === "motor" ? optionalText(b.condition_type) : null,
+        category === "motor" ? optionalText(b.brand) : null,
+        category === "motor" ? optionalText(b.model) : null,
+        category === "motor" ? optionalText(b.body_type) : null,
+        category === "motor" ? optionalNumber(b.year) : null,
+        category === "motor" ? optionalText(b.fuel_type) : null,
+        category === "motor" ? optionalText(b.transmission) : null,
+        category === "motor" ? optionalText(b.drive_type) : null,
+        category === "motor" ? optionalText(b.air_con) : null,
+        category === "motor" ? optionalNumber(b.engine_cc) : null,
+        category === "motor" ? optionalNumber(b.mileage_km) : null,
+        category === "part" ? optionalText(b.part_name) : null,
+        category === "part" ? optionalText(b.part_make) : null,
+        category === "part" ? optionalText(b.part_model) : null,
+        category === "part" ? optionalNumber(b.year_from) : null,
+        category === "part" ? optionalNumber(b.year_to) : null,
+        category === "part" ? optionalText(b.part_condition) : null,
+        category === "part" ? optionalText(b.part_authenticity) : null,
+        optionalText(b.whatsapp_phone) ? normalizeKenyanPhone(b.whatsapp_phone) : null,
+        optionalText(b.call_phone),
         useFreePost ? 0 : 1,
         expiresAt,
       ],
@@ -1103,54 +1300,90 @@ app.put("/api/listings/:id", async (req, res) => {
     const existing = serializeRows(r.rows)[0];
     const b = req.body;
 
-    if (b.seller_id && b.seller_id !== existing.seller_id) {
+    if (!b.seller_id || b.seller_id !== existing.seller_id) {
       return res.status(403).json({ error: "Only the post owner can edit this listing." });
     }
 
-    const title =
-      existing.category === "motor"
-        ? `${b.year ?? existing.year} ${b.brand ?? existing.brand} ${b.model ?? existing.model}`.trim()
-        : `${b.part_name ?? existing.part_name} (${b.part_make ?? existing.part_make} ${b.part_model ?? existing.part_model})`.trim();
+    const text = (key) => Object.hasOwn(b, key) ? optionalText(b[key]) : existing[key];
+    const number = (key) => Object.hasOwn(b, key) ? optionalNumber(b[key]) : existing[key];
+    const description = String(b.description ?? existing.description ?? "").trim();
+    if (!description) return res.status(400).json({ error: "A description is required." });
+    const price = Object.hasOwn(b, "price_kes") ? optionalNumber(b.price_kes) ?? 0 : Number(existing.price_kes);
+    if (price < 0) return res.status(400).json({ error: "Price cannot be negative." });
+    const next = {
+      vehicle_type: text("vehicle_type"),
+      reg_number: text("reg_number"),
+      condition_type: text("condition_type"),
+      brand: text("brand"),
+      model: text("model"),
+      body_type: text("body_type"),
+      year: number("year"),
+      fuel_type: text("fuel_type"),
+      transmission: text("transmission"),
+      drive_type: text("drive_type"),
+      air_con: text("air_con"),
+      engine_cc: number("engine_cc"),
+      mileage_km: number("mileage_km"),
+      part_name: text("part_name"),
+      part_make: text("part_make"),
+      part_model: text("part_model"),
+      year_from: number("year_from"),
+      year_to: number("year_to"),
+      part_condition: text("part_condition"),
+      part_authenticity: text("part_authenticity"),
+      whatsapp_phone: Object.hasOwn(b, "whatsapp_phone")
+        ? (optionalText(b.whatsapp_phone) ? normalizeKenyanPhone(b.whatsapp_phone) : null)
+        : existing.whatsapp_phone,
+      call_phone: text("call_phone"),
+    };
+    const title = existing.category === "motor"
+      ? [next.year, next.brand, next.model].filter(Boolean).join(" ") || "Motor listing"
+      : [next.part_name, next.part_make, next.part_model].filter(Boolean).join(" ") || "Spare parts listing";
 
     await db.execute({
       sql: `UPDATE listings SET
         title = ?, price_kes = ?, negotiable = ?, town = ?, description = ?,
         vehicle_type = ?, reg_number = ?, condition_type = ?, brand = ?, model = ?, body_type = ?,
         year = ?, fuel_type = ?, transmission = ?, drive_type = ?, air_con = ?, engine_cc = ?, mileage_km = ?,
-        part_name = ?, part_make = ?, part_model = ?, year_from = ?, year_to = ?, part_condition = ?, part_authenticity = ?
+        part_name = ?, part_make = ?, part_model = ?, year_from = ?, year_to = ?, part_condition = ?, part_authenticity = ?,
+        whatsapp_phone = ?, call_phone = ?
         WHERE id = ?`,
       args: [
         title,
-        Number(b.price_kes ?? existing.price_kes),
-        b.negotiable ?? existing.negotiable,
-        b.town ?? existing.town,
-        b.description ?? existing.description,
-        b.vehicle_type ?? existing.vehicle_type,
-        b.reg_number ?? existing.reg_number,
-        b.condition_type ?? existing.condition_type,
-        b.brand ?? existing.brand,
-        b.model ?? existing.model,
-        b.body_type ?? existing.body_type,
-        b.year ? Number(b.year) : existing.year,
-        b.fuel_type ?? existing.fuel_type,
-        b.transmission ?? existing.transmission,
-        b.drive_type ?? existing.drive_type,
-        b.air_con ?? existing.air_con,
-        b.engine_cc ? Number(b.engine_cc) : existing.engine_cc,
-        b.mileage_km ? Number(b.mileage_km) : existing.mileage_km,
-        b.part_name ?? existing.part_name,
-        b.part_make ?? existing.part_make,
-        b.part_model ?? existing.part_model,
-        b.year_from ? Number(b.year_from) : existing.year_from,
-        b.year_to ? Number(b.year_to) : existing.year_to,
-        b.part_condition ?? existing.part_condition,
-        b.part_authenticity ?? existing.part_authenticity,
+        price,
+        b.negotiable === "No" ? "No" : "Yes",
+        String(b.town ?? existing.town ?? "").trim(),
+        description,
+        next.vehicle_type,
+        next.reg_number,
+        next.condition_type,
+        next.brand,
+        next.model,
+        next.body_type,
+        next.year,
+        next.fuel_type,
+        next.transmission,
+        next.drive_type,
+        next.air_con,
+        next.engine_cc,
+        next.mileage_km,
+        next.part_name,
+        next.part_make,
+        next.part_model,
+        next.year_from,
+        next.year_to,
+        next.part_condition,
+        next.part_authenticity,
+        next.whatsapp_phone,
+        next.call_phone,
         req.params.id,
       ],
     });
 
-    if (Array.isArray(b.photos) && b.photos.length > 0) {
-      if (b.photos.length > 6) return res.status(400).json({ error: "Maximum 6 photos allowed." });
+    if (Array.isArray(b.photos)) {
+      if (b.photos.some((photo) => typeof photo !== "string")) {
+        return res.status(400).json({ error: "Listing photos must be image data." });
+      }
       await db.execute({ sql: `DELETE FROM listing_photos WHERE listing_id = ?`, args: [req.params.id] });
       for (let i = 0; i < b.photos.length; i++) {
         await db.execute({
@@ -1175,7 +1408,7 @@ app.patch("/api/listings/:id/status", async (req, res) => {
     if (r.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
     const existing = enrichListing(serializeRows(r.rows)[0]);
 
-    if (seller_id && seller_id !== existing.seller_id) return res.status(403).json({ error: "Unauthorized" });
+    if (!seller_id || seller_id !== existing.seller_id) return res.status(403).json({ error: "Unauthorized" });
     if (existing.status === "expired") {
       return res.status(403).json({ error: "This post has expired after 70 days." });
     }
@@ -1183,8 +1416,36 @@ app.patch("/api/listings/:id/status", async (req, res) => {
       return res.status(403).json({ error: "Listing is currently under Admin approval or safety review." });
     }
 
-    await db.execute({ sql: `UPDATE listings SET status = ? WHERE id = ?`, args: [status, req.params.id] });
+    await db.execute({
+      sql: `UPDATE listings
+            SET status = ?,
+                priority_amount_kes = CASE WHEN ? = 'sold' THEN 0 ELSE priority_amount_kes END,
+                priority_expires_at = CASE WHEN ? = 'sold' THEN NULL ELSE priority_expires_at END,
+                priority_plan_name = CASE WHEN ? = 'sold' THEN NULL ELSE priority_plan_name END
+            WHERE id = ?`,
+      args: [status, status, status, status, req.params.id],
+    });
     res.json({ message: `Post marked as ${status}.` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/listings/:id", async (req, res) => {
+  try {
+    const sellerId = req.body?.seller_id || req.query.seller_id;
+    const listing = await db.execute({
+      sql: `SELECT seller_id FROM listings WHERE id = ?`,
+      args: [req.params.id],
+    });
+    if (listing.rows.length === 0) return res.status(404).json({ error: "Listing not found." });
+    if (!sellerId || sellerId !== listing.rows[0].seller_id) {
+      return res.status(403).json({ error: "Only the post owner can delete this listing." });
+    }
+
+    await db.execute({ sql: `DELETE FROM listing_photos WHERE listing_id = ?`, args: [req.params.id] });
+    await db.execute({ sql: `DELETE FROM listings WHERE id = ?`, args: [req.params.id] });
+    res.json({ message: "Listing deleted." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1192,72 +1453,58 @@ app.patch("/api/listings/:id/status", async (req, res) => {
 
 app.post("/api/listings/:id/prioritize", async (req, res) => {
   try {
-    const bid = Number(req.body.amount_kes);
+    const { seller_id, priority_plan_id } = req.body;
     const paymentRef = req.body.payment_ref || "PAYHERO";
     const payerPhone = req.body.payer_phone || "";
 
     const lRes = await db.execute({
-      sql: `SELECT l.*, u.name AS seller_name, u.email AS seller_email, u.whatsapp_phone, u.call_phone
+      sql: `SELECT l.*, u.name AS seller_name, u.email AS seller_email,
+                   u.whatsapp_phone AS account_whatsapp_phone, u.call_phone AS account_call_phone
             FROM listings l JOIN users u ON u.id = l.seller_id WHERE l.id = ?`,
       args: [req.params.id],
     });
     if (lRes.rows.length === 0) return res.status(404).json({ error: "Listing not found." });
     const targetListing = enrichListing(serializeRows(lRes.rows)[0]);
+    if (!seller_id || seller_id !== targetListing.seller_id) {
+      return res.status(403).json({ error: "Only the post owner can prioritize this listing." });
+    }
     if (targetListing.status !== "active") {
       return res.status(400).json({ error: "Only active approved posts can be prioritized." });
     }
 
-    const sRows = await db.execute(`SELECT * FROM settings`);
-    const settings = {};
-    for (const r of sRows.rows) settings[r.key] = Number(r.value);
-
-    const baseFee = settings.base_priority_price_kes || 300;
-    const maxSlots = settings.max_daily_priority_slots || 20;
-
-    if (!bid || bid < baseFee) return res.status(400).json({ error: `Minimum priority fee is KES ${baseFee}.` });
-
-    const slotsRes = await db.execute({
-      sql: `SELECT id, priority_amount_kes FROM listings
-            WHERE status = 'active' AND priority_amount_kes > 0 AND priority_expires_at > CURRENT_TIMESTAMP AND id != ?
-            ORDER BY priority_amount_kes DESC`,
-      args: [req.params.id],
+    const planResult = await db.execute({
+      sql: `SELECT * FROM priority_plans WHERE id = ? AND active = 1`,
+      args: [priority_plan_id],
     });
-    const slots = serializeRows(slotsRes.rows);
-
-    if (slots.length >= maxSlots) {
-      const lowest = slots[maxSlots - 1];
-      if (bid <= lowest.priority_amount_kes) {
-        return res.status(400).json({
-          error: `Top ${maxSlots} slots are full. Bid higher than KES ${lowest.priority_amount_kes}.`,
-        });
-      }
-      await db.execute({
-        sql: `UPDATE listings SET priority_amount_kes = 0, priority_expires_at = NULL WHERE id = ?`,
-        args: [lowest.id],
-      });
-    }
+    if (planResult.rows.length === 0) return res.status(404).json({ error: "Priority plan not found." });
+    const plan = serializeRows(planResult.rows)[0];
+    const priorityExpiresAt = new Date(Date.now() + Number(plan.duration_hours) * 60 * 60 * 1000).toISOString();
 
     await db.execute({
-      sql: `UPDATE listings SET priority_amount_kes = ?, priority_expires_at = ? WHERE id = ?`,
-      args: [bid, new Date(Date.now() + 24 * 3600 * 1000).toISOString(), req.params.id],
+      sql: `UPDATE listings SET priority_amount_kes = ?, priority_expires_at = ?, priority_plan_name = ? WHERE id = ?`,
+      args: [plan.price_kes, priorityExpiresAt, plan.name, req.params.id],
     });
 
     await addSellerNotification(
       targetListing.seller_id,
-      `Payment confirmed (KES ${bid}): Post "${targetListing.title}" prioritized for 24 hours.`
+      `Payment confirmed (KES ${plan.price_kes}): Post "${targetListing.title}" prioritized for ${plan.duration_hours} hours (${plan.name}).`
     );
 
     await addAdminPaymentNotification({
       payerId: targetListing.seller_id,
       payerName: targetListing.seller_name,
       payerEmail: targetListing.seller_email,
-      payerPhone: payerPhone || targetListing.whatsapp_phone || targetListing.call_phone,
-      amountKes: bid,
-      purpose: `Prioritise Post (24h): ${targetListing.title}`,
+      payerPhone: payerPhone || targetListing.whatsapp_phone || targetListing.account_whatsapp_phone ||
+        targetListing.call_phone || targetListing.account_call_phone,
+      amountKes: plan.price_kes,
+      purpose: `Prioritise Post (${plan.name}, ${plan.duration_hours}h): ${targetListing.title}`,
       reference: paymentRef,
     });
 
-    res.json({ message: `Payment confirmed! Prioritized at KES ${bid} for 24h.` });
+    res.json({
+      message: `Payment confirmed! "${targetListing.title}" is prioritized for ${plan.duration_hours} hours (${plan.name}).`,
+      priority_expires_at: priorityExpiresAt,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1269,7 +1516,8 @@ app.post("/api/listings/:id/prioritize", async (req, res) => {
 app.get("/api/admin/overview", requireAdminKey, async (req, res) => {
   try {
     const listingsRes = await db.execute(`
-      SELECT l.*, u.name AS seller_name, u.email AS seller_email, u.whatsapp_phone, u.call_phone,
+      SELECT l.*, u.name AS seller_name, u.email AS seller_email,
+             u.whatsapp_phone AS account_whatsapp_phone, u.call_phone AS account_call_phone,
              (SELECT photo_data FROM listing_photos p WHERE p.listing_id = l.id ORDER BY p.sort_order ASC LIMIT 1) AS cover_photo
       FROM listings l JOIN users u ON u.id = l.seller_id
       ORDER BY CASE l.status WHEN 'reported_suspended' THEN 1 WHEN 'pending_approval' THEN 2 WHEN 'active' THEN 3 WHEN 'expired' THEN 4 ELSE 5 END, l.created_at DESC
@@ -1285,16 +1533,26 @@ app.get("/api/admin/overview", requireAdminKey, async (req, res) => {
       SELECT * FROM admin_payment_notifications ORDER BY created_at DESC LIMIT 100
     `);
     const plans = await db.execute(`SELECT * FROM post_plans ORDER BY price_kes ASC`);
+    const priorityPlans = await db.execute(`SELECT * FROM priority_plans ORDER BY duration_hours ASC, price_kes ASC`);
     const catalog = await db.execute(`SELECT * FROM vehicle_catalog ORDER BY brand ASC, model ASC`);
     const sRows = await db.execute(`SELECT * FROM settings`);
     const settings = {};
     for (const r of sRows.rows) settings[r.key] = r.value;
 
+    const listings = serializeRows(listingsRes.rows).map((listing) => {
+      listing.whatsapp_phone = listing.whatsapp_phone || listing.account_whatsapp_phone;
+      listing.call_phone = listing.call_phone || listing.account_call_phone;
+      delete listing.account_whatsapp_phone;
+      delete listing.account_call_phone;
+      return enrichListing(listing);
+    });
+
     res.json({
-      listings: serializeRows(listingsRes.rows).map(enrichListing),
+      listings,
       users: serializeRows(users.rows).map(sanitizeUser),
       paymentNotifications: serializeRows(paymentNotifications.rows),
       plans: serializeRows(plans.rows),
+      priorityPlans: serializeRows(priorityPlans.rows),
       catalog: serializeRows(catalog.rows),
       settings,
     });
@@ -1330,6 +1588,119 @@ app.post("/api/admin/listings/:id/moderate", requireAdminKey, async (req, res) =
       args: [status, nextExpiresAt, status, req.params.id],
     });
     res.json({ message: `Post status changed to ${status}.` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/admin/listings/:id", requireAdminKey, async (req, res) => {
+  try {
+    const listing = await db.execute({
+      sql: `SELECT id FROM listings WHERE id = ?`,
+      args: [req.params.id],
+    });
+    if (listing.rows.length === 0) return res.status(404).json({ error: "Listing not found." });
+
+    const { title, price_kes, town, description } = req.body;
+    if (!String(title || "").trim() || !String(description || "").trim()) {
+      return res.status(400).json({ error: "Title and description are required." });
+    }
+    const price = optionalNumber(price_kes) ?? 0;
+    if (price < 0) return res.status(400).json({ error: "Price cannot be negative." });
+
+    await db.execute({
+      sql: `UPDATE listings SET title = ?, price_kes = ?, town = ?, description = ? WHERE id = ?`,
+      args: [
+        String(title).trim(),
+        price,
+        String(town || "").trim(),
+        String(description).trim(),
+        req.params.id,
+      ],
+    });
+    res.json({ message: "Listing updated." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/admin/users/:id/profile", requireAdminKey, async (req, res) => {
+  try {
+    const userResult = await db.execute({
+      sql: `SELECT * FROM users WHERE id = ?`,
+      args: [req.params.id],
+    });
+    if (userResult.rows.length === 0) return res.status(404).json({ error: "Account not found." });
+    const existing = serializeRows(userResult.rows)[0];
+
+    const { name, role, town, whatsapp_phone, call_phone, agent_of } = req.body;
+    if (!String(name ?? existing.name).trim() || !["private", "dealer"].includes(role)) {
+      return res.status(400).json({ error: "Enter a name and a valid account type." });
+    }
+    let agentId = agent_of || null;
+    if (agentId) {
+      const dealer = await db.execute({
+        sql: `SELECT id FROM users WHERE id = ? AND role = 'dealer' AND is_suspended = 0`,
+        args: [agentId],
+      });
+      if (dealer.rows.length === 0 || agentId === req.params.id) {
+        return res.status(400).json({ error: "Select an active dealership for this agent." });
+      }
+    }
+    if (role === "dealer") agentId = null;
+
+    const normalizedWhatsApp = normalizeKenyanPhone(whatsapp_phone ?? existing.whatsapp_phone);
+    const phoneKey = phoneRegistryKey(normalizedWhatsApp);
+    if (phoneKey) {
+      const registeredPhone = await db.execute({
+        sql: `SELECT user_id FROM whatsapp_phone_registry WHERE phone_key = ?`,
+        args: [phoneKey],
+      });
+      if (registeredPhone.rows.some((row) => row.user_id !== req.params.id)) {
+        return res.status(409).json({ error: "This WhatsApp number is already used by another account." });
+      }
+      if (registeredPhone.rows.length === 0) {
+        try {
+          await db.execute({
+            sql: `INSERT INTO whatsapp_phone_registry (phone_key, user_id) VALUES (?, ?)`,
+            args: [phoneKey, req.params.id],
+          });
+        } catch (err) {
+          if (String(err.message).includes("UNIQUE constraint failed")) {
+            return res.status(409).json({ error: "This WhatsApp number is already used by another account." });
+          }
+          throw err;
+        }
+      }
+    }
+
+    try {
+      await db.execute({
+        sql: `UPDATE users SET name = ?, role = ?, town = ?, whatsapp_phone = ?, call_phone = ?, agent_of = ? WHERE id = ?`,
+        args: [
+          String(name ?? existing.name).trim(),
+          role,
+          String(town ?? existing.town ?? "").trim(),
+          normalizedWhatsApp,
+          String(call_phone ?? existing.call_phone ?? "").trim(),
+          agentId,
+          req.params.id,
+        ],
+      });
+    } catch (err) {
+      if (phoneKey && phoneKey !== phoneRegistryKey(existing.whatsapp_phone)) {
+        await db.execute({
+          sql: `DELETE FROM whatsapp_phone_registry WHERE phone_key = ? AND user_id = ?`,
+          args: [phoneKey, req.params.id],
+        });
+      }
+      throw err;
+    }
+    await db.execute({
+      sql: `DELETE FROM whatsapp_phone_registry WHERE user_id = ? AND phone_key != ?`,
+      args: [req.params.id, phoneKey],
+    });
+    res.json({ message: agentId ? "Dealership agent updated." : "Account updated." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1412,6 +1783,56 @@ app.post("/api/admin/plans", requireAdminKey, async (req, res) => {
       args: [crypto.randomUUID(), name, Number(post_count), Number(price_kes)],
     });
     res.json({ message: "Plan created." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/priority-plans", requireAdminKey, async (req, res) => {
+  try {
+    const { name, duration_hours, price_kes } = req.body;
+    const duration = Number(duration_hours);
+    const price = Number(price_kes);
+    if (!String(name || "").trim() || !Number.isInteger(duration) || duration < 1 || !Number.isInteger(price) || price < 1) {
+      return res.status(400).json({ error: "Enter a plan name, duration in hours, and price greater than zero." });
+    }
+    await db.execute({
+      sql: `INSERT INTO priority_plans (id, name, duration_hours, price_kes) VALUES (?, ?, ?, ?)`,
+      args: [crypto.randomUUID(), String(name).trim(), duration, price],
+    });
+    res.status(201).json({ message: "Priority plan created." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/admin/priority-plans/:id", requireAdminKey, async (req, res) => {
+  try {
+    const { name, duration_hours, price_kes, active = true } = req.body;
+    const duration = Number(duration_hours);
+    const price = Number(price_kes);
+    if (!String(name || "").trim() || !Number.isInteger(duration) || duration < 1 || !Number.isInteger(price) || price < 1) {
+      return res.status(400).json({ error: "Enter a plan name, duration in hours, and price greater than zero." });
+    }
+    const result = await db.execute({
+      sql: `UPDATE priority_plans SET name = ?, duration_hours = ?, price_kes = ?, active = ? WHERE id = ?`,
+      args: [String(name).trim(), duration, price, active ? 1 : 0, req.params.id],
+    });
+    if (Number(result.rowsAffected || 0) === 0) return res.status(404).json({ error: "Priority plan not found." });
+    res.json({ message: "Priority plan updated." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/admin/priority-plans/:id", requireAdminKey, async (req, res) => {
+  try {
+    const result = await db.execute({
+      sql: `DELETE FROM priority_plans WHERE id = ?`,
+      args: [req.params.id],
+    });
+    if (Number(result.rowsAffected || 0) === 0) return res.status(404).json({ error: "Priority plan not found." });
+    res.json({ message: "Priority plan deleted." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

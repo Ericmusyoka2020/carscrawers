@@ -55,6 +55,25 @@ function rowsToArray(result) {
   });
 }
 
+async function ensureListingColumns() {
+  const infoRes = await db.execute("PRAGMA table_info(listings)");
+  const existingCols = new Set(rowsToArray(infoRes).map((col) => col.name));
+
+  const requiredColumns = [
+    ["published_at", "TEXT"],
+    ["priority_amount_kes", "INTEGER DEFAULT 0"],
+    ["priority_date", "TEXT"],
+    ["report_reason", "TEXT"],
+    ["is_paid_post", "INTEGER DEFAULT 0"],
+  ];
+
+  for (const [colName, colDef] of requiredColumns) {
+    if (!existingCols.has(colName)) {
+      await db.execute(`ALTER TABLE listings ADD COLUMN ${colName} ${colDef}`);
+    }
+  }
+}
+
 async function initDb() {
   await db.batch(
     [
@@ -173,6 +192,8 @@ async function initDb() {
     ],
     "write"
   );
+
+  await ensureListingColumns();
 
   const settingsCount = await db.execute("SELECT COUNT(*) AS cnt FROM platform_settings");
   if (Number(settingsCount.rows[0]?.[0] || 0) === 0) {

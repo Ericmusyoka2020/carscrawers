@@ -1,4 +1,3 @@
-
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -13,11 +12,34 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "15mb" }));
+app.use(express.static(__dirname));
+app.use("/public", express.static(path.join(__dirname, "public")));
 
-const ADMIN_SECRET = process.env.ADMIN_SECRET || "wariara_admin_2026";
+app.get("/api/config", (req, res) => {
+  const requestOrigin = `${req.protocol}://${req.get("host")}`;
+  res.json({
+    apiBase: process.env.WARIARA_API_BASE || requestOrigin,
+    payHeroBase: process.env.PAYHERO_BACKEND_URL || "",
+    firebase: {
+      apiKey: process.env.FIREBASE_API_KEY,
+      authDomain: process.env.FIREBASE_AUTH_DOMAIN,
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+      messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
+      appId: process.env.FIREBASE_APP_ID,
+      measurementId: process.env.FIREBASE_MEASUREMENT_ID,
+    },
+  });
+});
+
+const ADMIN_SECRET = process.env.ADMIN_SECRET;
 const PAID_POST_LIFETIME_DAYS = 70;
-const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || "service_39pgd3j";
-const EMAILJS_TEMPLATE_ID = process.env.EMAILJS_TEMPLATE_ID || "template_euj4t1e";
+const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID;
+const EMAILJS_TEMPLATE_ID = process.env.EMAILJS_TEMPLATE_ID;
+
+if (!ADMIN_SECRET || !process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN) {
+  console.warn("Missing required environment configuration. Check your .env file.");
+}
 
 const db = createClient({
   url: process.env.TURSO_DATABASE_URL,
@@ -140,12 +162,22 @@ async function addAdminPaymentNotification({ payerId, payerName, payerEmail, pay
   });
 }
 
-function requireAdminKey(req, res, next) {
+async function requireAdminKey(req, res, next) {
   const key = req.headers["x-admin-key"] || req.query.admin_key;
-  if (!key || key !== ADMIN_SECRET) {
-    return res.status(401).json({ ok: false, error: "Invalid Admin Portal key." });
+  if (key && key === ADMIN_SECRET) return next();
+
+  const subToken = req.headers["x-sub-admin-session"];
+  if (subToken) {
+    const r = await db.execute({ sql: `SELECT session_token_hash, session_expires_at FROM admin_sub_accounts WHERE id = 'primary'` });
+    if (r.rows.length > 0) {
+      const account = serializeRows(r.rows)[0];
+      if (!account.session_expires_at || new Date(account.session_expires_at).getTime() <= Date.now()) {
+        return res.status(401).json({ ok: false, error: "Sub-admin session expired." });
+      }
+      if (hashToken(String(subToken)) === account.session_token_hash) return next();
+    }
   }
-  next();
+  return res.status(401).json({ ok: false, error: "Invalid Admin Portal authentication." });
 }
 
 async function ensureUsersAndListingsColumns() {
@@ -167,6 +199,9 @@ async function ensureUsersAndListingsColumns() {
       ["suspension_reason", "TEXT"],
       ["appeal_text", "TEXT"],
       ["appeal_status", "TEXT DEFAULT 'none'"],
+      ["appeal_count", "INTEGER DEFAULT 0"],
+      ["firebase_uid", "TEXT"],
+      ["appeal_response", "TEXT"],
       ["agent_of", "TEXT"],
     ];
     for (const [colName, colDef] of columnsToAdd) {
@@ -226,8 +261,23 @@ async function initDatabase() {
       suspension_reason TEXT,
       appeal_text TEXT,
       appeal_status TEXT DEFAULT 'none',
+      appeal_count INTEGER DEFAULT 0,
+      firebase_uid TEXT,
+      appeal_response TEXT,
       agent_of TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS admin_sub_accounts (
+      id TEXT PRIMARY KEY,
+      email TEXT UNIQUE,
+      password_hash TEXT NOT NULL,
+      two_factor_enabled INTEGER DEFAULT 0,
+      code_hash TEXT,
+      code_expires_at DATETIME,
+      code_used_at DATETIME,
+      session_token_hash TEXT,
+      session_expires_at DATETIME,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`,
     `CREATE TABLE IF NOT EXISTS password_resets (
       id TEXT PRIMARY KEY,
@@ -495,6 +545,7 @@ app.post("/api/sellers/account", async (req, res) => {
       call_phone,
       role = "private",
       town = "Nakuru",
+      firebase_uid,
     } = req.body;
 
     if (!name || !email || !whatsapp_phone || !call_phone) {
@@ -578,6 +629,9 @@ app.post("/api/sellers/account", async (req, res) => {
       throw err;
     }
 
+    if (firebase_uid) {
+      await db.execute({ sql: `UPDATE users SET firebase_uid = ? WHERE id = ?`, args: [String(firebase_uid), id] });
+    }
     await addSellerNotification(id, "Account created. You have 6 free posts available.");
     const created = await db.execute({ sql: `SELECT * FROM users WHERE id = ?`, args: [id] });
     res.status(201).json({ user: sanitizeUser(serializeRows(created.rows)[0]) });
@@ -588,18 +642,23 @@ app.post("/api/sellers/account", async (req, res) => {
 
 app.post("/api/sellers/login", async (req, res) => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required." });
-    }
+    const { email, password, firebase_uid } = req.body;
+    if (!email) return res.status(400).json({ error: "Email is required." });
     const cleanEmail = email.trim().toLowerCase();
     const r = await db.execute({ sql: `SELECT * FROM users WHERE email = ?`, args: [cleanEmail] });
     if (r.rows.length === 0) return res.status(404).json({ error: "Seller account not found." });
     const user = serializeRows(r.rows)[0];
+    if (firebase_uid) {
+      if (user.firebase_uid && user.firebase_uid !== String(firebase_uid)) {
+        return res.status(401).json({ error: "This Firebase account does not match the seller account." });
+      }
+      await db.execute({ sql: `UPDATE users SET firebase_uid = ? WHERE id = ?`, args: [String(firebase_uid), user.id] });
+      const updated = await db.execute({ sql: `SELECT * FROM users WHERE id = ?`, args: [user.id] });
+      return res.json({ user: sanitizeUser(serializeRows(updated.rows)[0]) });
+    }
+    if (!password) return res.status(400).json({ error: "Password is required." });
     if (!user.password_hash) {
-      return res.status(400).json({
-        error: "No password is set on this account yet. Use Forgot Password to set one.",
-      });
+      return res.status(400).json({ error: "No password is set on this account yet. Use Forgot Password to set one." });
     }
     if (!verifyPassword(password, user.password_hash)) {
       return res.status(401).json({ error: "Invalid email or password." });
@@ -819,11 +878,16 @@ app.post("/api/sellers/:id/appeal", async (req, res) => {
     if (!appeal_text || appeal_text.trim().length < 4) {
       return res.status(400).json({ error: "Enter a review request message." });
     }
+    const account = await db.execute({ sql: `SELECT appeal_count, is_suspended FROM users WHERE id = ?`, args: [req.params.id] });
+    if (account.rows.length === 0) return res.status(404).json({ error: "Account not found." });
+    const current = serializeRows(account.rows)[0];
+    if (!current.is_suspended) return res.status(400).json({ error: "Only suspended accounts can request review." });
+    if (Number(current.appeal_count || 0) >= 2) return res.status(429).json({ error: "You have used both review requests for this suspension." });
     await db.execute({
-      sql: `UPDATE users SET appeal_text = ?, appeal_status = 'pending' WHERE id = ?`,
+      sql: `UPDATE users SET appeal_text = ?, appeal_status = 'pending', appeal_count = appeal_count + 1 WHERE id = ?`,
       args: [appeal_text.trim(), req.params.id],
     });
-    res.json({ message: "Suspension review request sent to Admin." });
+    res.json({ message: "Suspension review request sent to Admin and Admin Sub." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1095,10 +1159,10 @@ app.post("/api/listings/:id/report", async (req, res) => {
     const { reason } = req.body;
     if (!reason || reason.trim().length < 3) return res.status(400).json({ error: "Provide a report reason." });
     await db.execute({
-      sql: `UPDATE listings SET status = 'reported_suspended', report_reason = ?, reported_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'active'`,
+      sql: `UPDATE listings SET report_reason = ?, reported_at = CURRENT_TIMESTAMP WHERE id = ?`,
       args: [reason.trim(), req.params.id],
     });
-    res.json({ message: "Post reported and automatically suspended pending Admin safety review." });
+    res.json({ message: "Your report has been sent to Wariara Cars Central Rift for direct post review. The post will remain visible while it is reviewed." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1185,10 +1249,13 @@ app.post("/api/listings", async (req, res) => {
     const town = String(b.town || seller.town || "").trim();
     const description = String(b.description || "").trim();
 
-    if (!description) return res.status(400).json({ error: "A description is required." });
+    const hasListingInformation = Boolean(description || b.year || b.brand || b.model || b.part_name || b.part_make || b.part_model || b.price_kes);
+    if (!hasListingInformation) return res.status(400).json({ error: "Enter at least one listing detail or a description." });
     if (priceNum < 0) return res.status(400).json({ error: "Price cannot be negative." });
 
     const photos = Array.isArray(b.photos) ? b.photos : [];
+    if (photos.length < 1) return res.status(400).json({ error: "Add at least 1 photo." });
+    if (photos.length > 5) return res.status(400).json({ error: "A listing may contain at most 5 photos." });
     if (photos.some((photo) => typeof photo !== "string")) {
       return res.status(400).json({ error: "Listing photos must be image data." });
     }
@@ -1246,8 +1313,8 @@ app.post("/api/listings", async (req, res) => {
         category === "part" ? optionalNumber(b.year_to) : null,
         category === "part" ? optionalText(b.part_condition) : null,
         category === "part" ? optionalText(b.part_authenticity) : null,
-        optionalText(b.whatsapp_phone) ? normalizeKenyanPhone(b.whatsapp_phone) : null,
-        optionalText(b.call_phone),
+        normalizeKenyanPhone(seller.whatsapp_phone),
+        seller.call_phone || seller.phone || null,
         useFreePost ? 0 : 1,
         expiresAt,
       ],
@@ -1384,6 +1451,7 @@ app.put("/api/listings/:id", async (req, res) => {
       if (b.photos.some((photo) => typeof photo !== "string")) {
         return res.status(400).json({ error: "Listing photos must be image data." });
       }
+      if (b.photos.length > 5) return res.status(400).json({ error: "A listing may contain at most 5 photos." });
       await db.execute({ sql: `DELETE FROM listing_photos WHERE listing_id = ?`, args: [req.params.id] });
       for (let i = 0; i < b.photos.length; i++) {
         await db.execute({
@@ -1709,7 +1777,15 @@ app.put("/api/admin/users/:id/profile", requireAdminKey, async (req, res) => {
 app.post("/api/admin/users/:id/gift-posts", requireAdminKey, async (req, res) => {
   try {
     const count = Number(req.body.posts_count);
+    const confirmPhone = String(req.body.confirm_whatsapp || "").trim();
     if (!count || count < 1) return res.status(400).json({ error: "Enter valid posts count." });
+    if (!confirmPhone) return res.status(400).json({ error: "Enter the seller's registered WhatsApp number." });
+    const target = await db.execute({ sql: `SELECT whatsapp_phone, name FROM users WHERE id = ?`, args: [req.params.id] });
+    if (target.rows.length === 0) return res.status(404).json({ error: "Account not found." });
+    const targetUser = serializeRows(target.rows)[0];
+    if (phoneRegistryKey(targetUser.whatsapp_phone) !== phoneRegistryKey(confirmPhone)) {
+      return res.status(400).json({ error: "Gift cancelled: the WhatsApp number does not match this account." });
+    }
     await db.execute({
       sql: `UPDATE users SET paid_post_credits = paid_post_credits + ? WHERE id = ?`,
       args: [count, req.params.id],
@@ -1733,17 +1809,106 @@ app.post("/api/admin/users/:id/suspension", requireAdminKey, async (req, res) =>
     const { suspend, reason } = req.body;
     if (suspend) {
       await db.execute({
-        sql: `UPDATE users SET is_suspended = 1, suspension_reason = ?, appeal_status = 'none' WHERE id = ?`,
+        sql: `UPDATE users SET is_suspended = 1, suspension_reason = ?, appeal_status = 'none', appeal_count = 0 WHERE id = ?`,
         args: [reason || "Suspended for scamming / policy violation", req.params.id],
       });
-      res.json({ message: "Account suspended." });
+      await db.execute({ sql: `UPDATE listings SET status = 'paused' WHERE seller_id = ? AND status IN ('active', 'pending_approval')`, args: [req.params.id] });
+      await addSellerNotification(req.params.id, `Account suspended: ${reason || "Policy review required"}. All posts are paused.`);
+      res.json({ message: "Account suspended and all posts paused." });
     } else {
       await db.execute({
-        sql: `UPDATE users SET is_suspended = 0, suspension_reason = NULL, appeal_status = 'resolved' WHERE id = ?`,
+        sql: `UPDATE users SET is_suspended = 0, suspension_reason = NULL, appeal_status = 'resolved', appeal_count = 0 WHERE id = ?`,
         args: [req.params.id],
       });
-      res.json({ message: "Account restored." });
+      await db.execute({ sql: `UPDATE listings SET status = 'active' WHERE seller_id = ? AND status = 'paused'`, args: [req.params.id] });
+      await addSellerNotification(req.params.id, "Account restored. Your paused posts are active again.");
+      res.json({ message: "Account restored and posts unpaused." });
     }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/users/:id/appeal", requireAdminKey, async (req, res) => {
+  try {
+    const { action, response } = req.body;
+    if (!["accept", "reject"].includes(action)) return res.status(400).json({ error: "Invalid appeal action." });
+    const message = String(response || "").trim();
+    if (!message) return res.status(400).json({ error: "Enter a response for the seller." });
+
+    await db.execute({
+      sql: `UPDATE users SET appeal_status = ?, appeal_response = ? WHERE id = ?`,
+      args: [action === "accept" ? "accepted" : "rejected", message, req.params.id],
+    });
+    await addSellerNotification(req.params.id, `Suspension appeal ${action === "accept" ? "accepted" : "rejected"}: ${message}`);
+
+    if (action === "accept") {
+      await db.execute({ sql: `UPDATE users SET is_suspended = 0, suspension_reason = NULL, appeal_count = 0 WHERE id = ?`, args: [req.params.id] });
+      await db.execute({ sql: `UPDATE listings SET status = 'active' WHERE seller_id = ? AND status = 'paused'`, args: [req.params.id] });
+    }
+    res.json({ message: `Appeal ${action === "accept" ? "accepted and account restored" : "rejected"}.` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/sub-account", requireAdminKey, async (req, res) => {
+  try {
+    const { email, password, two_factor_enabled } = req.body;
+    if (!email || !password || password.length < 6) return res.status(400).json({ error: "A valid sub-admin email and password of at least 6 characters are required." });
+    await db.execute({
+      sql: `INSERT INTO admin_sub_accounts (id, email, password_hash, two_factor_enabled, updated_at)
+            VALUES ('primary', ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET email = excluded.email, password_hash = excluded.password_hash,
+            two_factor_enabled = excluded.two_factor_enabled, updated_at = CURRENT_TIMESTAMP`,
+      args: [String(email).trim().toLowerCase(), hashPassword(password), two_factor_enabled ? 1 : 0],
+    });
+    res.json({ message: "Sub-admin password and email updated." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/sub/login", async (req, res) => {
+  try {
+    const { password } = req.body;
+    const r = await db.execute({ sql: `SELECT * FROM admin_sub_accounts WHERE id = 'primary'` });
+    if (r.rows.length === 0) return res.status(401).json({ error: "Sub-admin is not registered." });
+    const account = serializeRows(r.rows)[0];
+    if (!verifyPassword(String(password || ""), account.password_hash)) return res.status(401).json({ error: "Invalid sub-admin password." });
+
+    if (!Number(account.two_factor_enabled)) {
+      const token = crypto.randomBytes(32).toString("hex");
+      await db.execute({ sql: `UPDATE admin_sub_accounts SET session_token_hash = ?, session_expires_at = ? WHERE id = 'primary'`, args: [hashToken(token), new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString()] });
+      return res.json({ session_token: token, requires_code: false });
+    }
+
+    const code = String(crypto.randomInt(100000, 1000000));
+    await db.execute({ sql: `UPDATE admin_sub_accounts SET code_hash = ?, code_expires_at = ?, code_used_at = NULL WHERE id = 'primary'`, args: [hashToken(code), new Date(Date.now() + 10 * 60 * 1000).toISOString()] });
+    const publicKey = process.env.EMAILJS_PUBLIC_KEY;
+    const privateKey = process.env.EMAILJS_PRIVATE_KEY;
+    if (!publicKey || !privateKey) return res.status(503).json({ error: "Email verification is not configured." });
+    const mail = await fetch("https://api.emailjs.com/api/v1.0/email/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ service_id: EMAILJS_SERVICE_ID, template_id: EMAILJS_TEMPLATE_ID, user_id: publicKey, accessToken: privateKey, template_params: { to_email: account.email, subject: "Wariara sub-admin security code", message: `Your 3D security code is ${code}. It expires in 10 minutes.`, code, code_expiry_minutes: "10" } }) });
+    if (!mail.ok) return res.status(502).json({ error: "Could not send the security code." });
+    res.json({ requires_code: true, email_hint: account.email.replace(/(^.).*(@.*$)/, "$1***$2") });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/sub/verify", async (req, res) => {
+  try {
+    const { password, code } = req.body;
+    const r = await db.execute({ sql: `SELECT * FROM admin_sub_accounts WHERE id = 'primary'` });
+    if (r.rows.length === 0) return res.status(401).json({ error: "Sub-admin is not registered." });
+    const account = serializeRows(r.rows)[0];
+    if (!verifyPassword(String(password || ""), account.password_hash)) return res.status(401).json({ error: "Invalid sub-admin password." });
+    if (account.code_used_at || !account.code_expires_at || new Date(account.code_expires_at).getTime() <= Date.now()) return res.status(400).json({ error: "The security code is expired or has already been used." });
+    if (hashToken(String(code || "")) !== account.code_hash) return res.status(400).json({ error: "Invalid security code." });
+    await db.execute({ sql: `UPDATE admin_sub_accounts SET code_used_at = CURRENT_TIMESTAMP WHERE id = 'primary'` });
+    const token = crypto.randomBytes(32).toString("hex");
+    await db.execute({ sql: `UPDATE admin_sub_accounts SET session_token_hash = ?, session_expires_at = ? WHERE id = 'primary'`, args: [hashToken(token), new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString()] });
+    res.json({ session_token: token, requires_code: false });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1862,16 +2027,13 @@ const port = process.env.PORT || 3000;
 const isMainModule = process.argv[1] && path.resolve(process.argv[1]) === __filename;
 
 if (isMainModule) {
-  ensureDbReady()
-    .then(() => {
-      app.listen(port, () => {
-        console.log(`Wariara Cars Central Rift API running on http://localhost:${port}`);
-      });
-    })
-    .catch((err) => {
-      console.error("Startup failed:", err);
-      process.exit(1);
-    });
+  app.listen(port, () => {
+    console.log(`Wariara Cars Central Rift API running on http://localhost:${port}`);
+  });
+
+  ensureDbReady().catch((err) => {
+    console.error("Database initialization unavailable:", err.message);
+  });
 }
 
 export default app;

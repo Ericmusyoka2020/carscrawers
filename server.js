@@ -17,8 +17,10 @@ app.use("/public", express.static(path.join(__dirname, "public")));
 
 app.get("/api/config", (req, res) => {
   const requestOrigin = `${req.protocol}://${req.get("host")}`;
+  const configuredApiBase = process.env.WARIARA_API_BASE || requestOrigin;
+  const normalizedApiBase = configuredApiBase.replace(/^http:\/\//, "https://");
   res.json({
-    apiBase: process.env.WARIARA_API_BASE || requestOrigin,
+    apiBase: normalizedApiBase,
     payHeroBase: process.env.PAYHERO_BACKEND_URL || "",
     firebase: {
       apiKey: process.env.FIREBASE_API_KEY,

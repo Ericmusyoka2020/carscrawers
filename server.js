@@ -1,3 +1,4 @@
+
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -10,15 +11,39 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(cors());
+const allowedOrigins = (process.env.FRONTEND_ORIGINS || "http://localhost:3000,http://127.0.0.1:3000")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    const allowed = !origin || allowedOrigins.includes(origin) || /^https:\/\/[^.]+\.vercel\.app$/.test(origin || "");
+    return callback(null, allowed);
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "x-admin-key", "x-sub-admin-session"],
+}));
 app.use(express.json({ limit: "15mb" }));
+
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, service: "Wariara Cars Central Rift API" });
+});
+
+app.get("/", (req, res) => {
+  const frontendUrl = process.env.FRONTEND_URL;
+  if (frontendUrl) return res.redirect(302, frontendUrl);
+  res.json({ ok: true, service: "Wariara Cars Central Rift API", health: "/api/health" });
+});
 app.use(express.static(__dirname));
 app.use("/public", express.static(path.join(__dirname, "public")));
 
 app.get("/api/config", (req, res) => {
   const requestOrigin = `${req.protocol}://${req.get("host")}`;
   const configuredApiBase = process.env.WARIARA_API_BASE || requestOrigin;
-  const normalizedApiBase = configuredApiBase.replace(/^http:\/\//, "https://");
+  const normalizedApiBase = /^https?:\/\/localhost(?::|\/)/.test(configuredApiBase) || /^https?:\/\/127\.0\.0\.1(?::|\/)/.test(configuredApiBase)
+    ? configuredApiBase
+    : configuredApiBase.replace(/^http:\/\//, "https://");
   res.json({
     apiBase: normalizedApiBase,
     payHeroBase: process.env.PAYHERO_BACKEND_URL || "",

@@ -1,5 +1,4 @@
 
-
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
@@ -8,547 +7,431 @@ import { fileURLToPath } from "url";
 import { createClient } from "@libsql/client";
 
 const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
-const allowedOrigins = (process.env.FRONTEND_ORIGINS || "http://localhost:3000,https://cars.stackcrafts.com")
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
+const PORT = process.env.PORT || 3000;
 
-app.use(cors({
-  origin: (origin, callback) => {
-    const allowed = !origin || allowedOrigins.includes(origin) || /^https:\/\/[^.]+\.vercel\.app$/.test(origin || "");
-    return callback(null, allowed);
-  },
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "x-admin-key", "x-sub-admin-session"],
-}));
-app.use(express.json({ limit: "15mb" }));
+const TURSO_DATABASE_URL = process.env.TURSO_DATABASE_URL;
+const TURSO_AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN;
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "wariara-admin-secret";
+const EMAILJS_PUBLIC_KEY = process.env.EMAILJS_PUBLIC_KEY || "wc0_v2KwNXY2ZonsD";
+const EMAILJS_PRIVATE_KEY = process.env.EMAILJS_PRIVATE_KEY || "nJA7xh7xQMIoQPkEsuCw0";
 
-app.get("/api/health", (req, res) => {
-  res.json({ ok: true, service: "Wariara Cars Central Rift API" });
-});
-
-app.get("/", (req, res) => {
-  res.json({ ok: true, service: "Wariara Cars Central Rift API", health: "/api/health" });
-});
-
-app.get("/api/config", (req, res) => {
-  res.json({
-    firebase: {
-      apiKey: process.env.FIREBASE_API_KEY,
-      authDomain: process.env.FIREBASE_AUTH_DOMAIN,
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
-      messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
-      appId: process.env.FIREBASE_APP_ID,
-      measurementId: process.env.FIREBASE_MEASUREMENT_ID,
-    },
-  });
-});
-
-const ADMIN_SECRET = process.env.ADMIN_SECRET;
-const PAID_POST_LIFETIME_DAYS = 70;
-const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID;
-const EMAILJS_TEMPLATE_ID = process.env.EMAILJS_TEMPLATE_ID;
-
-if (!ADMIN_SECRET || !process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN) {
-  console.warn("Missing required server environment variables: ADMIN_SECRET, TURSO_DATABASE_URL, and/or TURSO_AUTH_TOKEN.");
+if (!TURSO_DATABASE_URL) {
+  console.error("Missing TURSO_DATABASE_URL environment variable.");
+  process.exit(1);
 }
 
 const db = createClient({
-  url: process.env.TURSO_DATABASE_URL,
-  authToken: process.env.TURSO_AUTH_TOKEN,
+  url: TURSO_DATABASE_URL,
+  authToken: TURSO_AUTH_TOKEN,
 });
 
-function serializeRows(rows) {
-  return rows.map((row) => {
-    const out = {};
-    for (const [k, v] of Object.entries(row)) {
-      out[k] = typeof v === "bigint" ? Number(v) : v;
-    }
-    return out;
+app.use(cors());
+app.use(express.json({ limit: "25mb" }));
+app.use(express.static(path.join(__dirname, "public")));
+
+function rowToObj(result, idx = 0) {
+  if (!result || !result.rows || !result.rows[idx]) return null;
+  const cols = result.columns;
+  const row = result.rows[idx];
+  const obj = {};
+  cols.forEach((col, i) => {
+    obj[col] = row[i];
+  });
+  return obj;
+}
+
+function rowsToArray(result) {
+  if (!result || !result.rows || result.rows.length === 0) return [];
+  const cols = result.columns;
+  return result.rows.map((row) => {
+    const obj = {};
+    cols.forEach((col, i) => {
+      obj[col] = row[i];
+    });
+    return obj;
   });
 }
 
-function sanitizeUser(user) {
-  if (!user) return null;
-  const { password_hash, ...safe } = user;
-  return safe;
+async function initDb() {
+  await db.batch(
+    [
+      `CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        whatsapp_phone TEXT NOT NULL,
+        call_phone TEXT NOT NULL,
+        role TEXT DEFAULT 'private',
+        town TEXT DEFAULT 'Nakuru',
+        shop_slug TEXT,
+        free_posts_used INTEGER DEFAULT 0,
+        paid_post_credits INTEGER DEFAULT 0,
+        total_purchased_posts INTEGER DEFAULT 0,
+        total_spent_kes INTEGER DEFAULT 0,
+        is_suspended INTEGER DEFAULT 0,
+        suspension_reason TEXT,
+        appeal_text TEXT,
+        appeal_status TEXT,
+        terms_accepted_at TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS password_reset_tokens (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        token TEXT UNIQUE NOT NULL,
+        expires_at TEXT NOT NULL,
+        used INTEGER DEFAULT 0,
+        used_at TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS vehicle_catalog (
+        id TEXT PRIMARY KEY,
+        vehicle_type TEXT NOT NULL,
+        brand TEXT NOT NULL,
+        model TEXT NOT NULL,
+        body_type TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS post_plans (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        post_count INTEGER NOT NULL,
+        price_kes INTEGER NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS platform_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS listings (
+        id TEXT PRIMARY KEY,
+        seller_id TEXT NOT NULL,
+        seller_name TEXT NOT NULL,
+        seller_slug TEXT,
+        whatsapp_phone TEXT,
+        call_phone TEXT,
+        category TEXT NOT NULL,
+        title TEXT NOT NULL,
+        vehicle_type TEXT,
+        condition_type TEXT,
+        brand TEXT,
+        model TEXT,
+        body_type TEXT,
+        year INTEGER,
+        reg_number TEXT,
+        fuel_type TEXT,
+        transmission TEXT,
+        drive_type TEXT,
+        air_con TEXT,
+        engine_cc INTEGER,
+        mileage_km INTEGER,
+        part_name TEXT,
+        part_make TEXT,
+        part_model TEXT,
+        year_from INTEGER,
+        year_to INTEGER,
+        part_condition TEXT,
+        part_authenticity TEXT,
+        price_kes INTEGER NOT NULL,
+        negotiable TEXT DEFAULT 'Yes',
+        town TEXT NOT NULL,
+        description TEXT NOT NULL,
+        status TEXT DEFAULT 'pending_approval',
+        is_paid_post INTEGER DEFAULT 0,
+        published_at TEXT,
+        priority_amount_kes INTEGER DEFAULT 0,
+        priority_date TEXT,
+        report_reason TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS listing_photos (
+        id TEXT PRIMARY KEY,
+        listing_id TEXT NOT NULL,
+        photo_data TEXT NOT NULL,
+        sort_order INTEGER DEFAULT 0
+      )`,
+      `CREATE TABLE IF NOT EXISTS seller_notifications (
+        id TEXT PRIMARY KEY,
+        seller_id TEXT NOT NULL,
+        message TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS payment_notifications (
+        id TEXT PRIMARY KEY,
+        seller_id TEXT,
+        payer_name TEXT,
+        payer_phone TEXT,
+        payer_email TEXT,
+        purpose TEXT NOT NULL,
+        amount_kes INTEGER DEFAULT 0,
+        payment_ref TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )`,
+    ],
+    "write"
+  );
+
+  const settingsCount = await db.execute("SELECT COUNT(*) AS cnt FROM platform_settings");
+  if (Number(settingsCount.rows[0]?.[0] || 0) === 0) {
+    await db.execute({
+      sql: "INSERT INTO platform_settings (key, value) VALUES (?, ?)",
+      args: ["base_priority_price_kes", "300"],
+    });
+  }
+
+  const plansCount = await db.execute("SELECT COUNT(*) AS cnt FROM post_plans");
+  if (Number(plansCount.rows[0]?.[0] || 0) === 0) {
+    await db.batch(
+      [
+        {
+          sql: "INSERT INTO post_plans (id, name, post_count, price_kes) VALUES (?, ?, ?, ?)",
+          args: ["plan-starter", "Starter Pack", 10, 200],
+        },
+        {
+          sql: "INSERT INTO post_plans (id, name, post_count, price_kes) VALUES (?, ?, ?, ?)",
+          args: ["plan-pro", "Dealer Pack", 25, 500],
+        },
+      ],
+      "write"
+    );
+  }
+
+  const catalogCount = await db.execute("SELECT COUNT(*) AS cnt FROM vehicle_catalog");
+  if (Number(catalogCount.rows[0]?.[0] || 0) === 0) {
+    const defaults = [
+      ["cat-1", "Car", "Toyota", "Fielder", "Station Wagon"],
+      ["cat-2", "Car", "Toyota", "Harrier", "SUV"],
+      ["cat-3", "Car", "Toyota", "Prado", "SUV"],
+      ["cat-4", "Car", "Mazda", "Demio", "Hatchback"],
+      ["cat-5", "Car", "Subaru", "Forester", "SUV"],
+      ["cat-6", "Car", "Volkswagen", "Golf", "Hatchback"],
+      ["cat-7", "Truck", "Isuzu", "FRR", "Lorry"],
+      ["cat-8", "Bike", "Honda", "XR150L", "Motorcycle"],
+    ];
+    for (const d of defaults) {
+      await db.execute({
+        sql: "INSERT OR IGNORE INTO vehicle_catalog (id, vehicle_type, brand, model, body_type) VALUES (?, ?, ?, ?, ?)",
+        args: d,
+      });
+    }
+  }
+}
+
+function requireAdmin(req, res, next) {
+  const key = req.headers["x-admin-key"] || req.query.admin_key;
+  if (!key || key !== ADMIN_SECRET) {
+    return res.status(401).json({ error: "Unauthorized: invalid admin key." });
+  }
+  next();
 }
 
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString("hex");
-  const derived = crypto.scryptSync(password, salt, 64).toString("hex");
+  const derived = crypto.scryptSync(String(password), salt, 64).toString("hex");
   return `${salt}:${derived}`;
 }
 
-function verifyPassword(password, storedHash) {
-  if (!storedHash || !storedHash.includes(":")) return false;
-  const [salt, keyHex] = storedHash.split(":");
+function verifyPassword(password, stored) {
+  if (!stored || !stored.includes(":")) return false;
+  const [salt, keyHex] = stored.split(":");
+  const derived = crypto.scryptSync(String(password), salt, 64);
   const keyBuf = Buffer.from(keyHex, "hex");
-  const derivedBuf = crypto.scryptSync(password, salt, 64);
-  if (keyBuf.length !== derivedBuf.length) return false;
-  return crypto.timingSafeEqual(keyBuf, derivedBuf);
+  if (derived.length !== keyBuf.length) return false;
+  return crypto.timingSafeEqual(derived, keyBuf);
 }
 
-function hashToken(rawToken) {
-  return crypto.createHash("sha256").update(rawToken).digest("hex");
+function slugify(str) {
+  return (
+    String(str || "seller")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 50) || `seller-${Date.now()}`
+  );
 }
 
-function computeRemainingDays(expiresAt) {
-  if (!expiresAt) return null;
-  const diffMs = new Date(expiresAt).getTime() - Date.now();
-  return Math.max(0, Math.ceil(diffMs / (24 * 3600 * 1000)));
+function todayKenyaDate() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "Africa/Nairobi" });
 }
 
-function normalizeKenyanPhone(phone) {
-  const digits = String(phone || "").replace(/\D/g, "");
-  if (digits.startsWith("0") && digits.length === 10) return `254${digits.slice(1)}`;
-  if (digits.startsWith("7") && digits.length === 9) return `254${digits}`;
-  if (digits.startsWith("2540") && digits.length === 13) return `254${digits.slice(4)}`;
-  if (digits.startsWith("254") && digits.length === 12) return digits;
-  return String(phone || "").trim();
+function computeDaysRemaining(listing) {
+  if (!Number(listing.is_paid_post)) return null;
+  const baseDate = listing.published_at || listing.created_at;
+  if (!baseDate) return 70;
+  const elapsedMs = Date.now() - new Date(baseDate).getTime();
+  const elapsedDays = Math.floor(elapsedMs / (1000 * 60 * 60 * 24));
+  return Math.max(0, 70 - elapsedDays);
 }
 
-function phoneRegistryKey(phone) {
-  return normalizeKenyanPhone(phone).replace(/\D/g, "");
+async function syncExpiredListings() {
+  const res = await db.execute(
+    "SELECT id, created_at, published_at, is_paid_post, status FROM listings WHERE is_paid_post = 1 AND status = 'active'"
+  );
+  const paidActive = rowsToArray(res);
+  if (paidActive.length === 0) return;
+
+  const expiredIds = paidActive
+    .filter((l) => computeDaysRemaining(l) === 0)
+    .map((l) => l.id);
+
+  const nowIso = new Date().toISOString();
+  for (const id of expiredIds) {
+    await db.execute({
+      sql: "UPDATE listings SET status = 'expired', updated_at = ? WHERE id = ?",
+      args: [nowIso, id],
+    });
+  }
 }
 
-function optionalText(value) {
-  const text = String(value ?? "").trim();
-  return text || null;
-}
-
-function optionalNumber(value) {
-  if (value === undefined || value === null || String(value).trim() === "") return null;
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
-function enrichListing(row) {
-  const isExpiredByTime = Boolean(row.expires_at && new Date(row.expires_at).getTime() <= Date.now());
-  const effectiveStatus = isExpiredByTime && row.status !== "unsafe_removed" ? "expired" : row.status;
-  const priorityExpiresAt = row.priority_expires_at ? new Date(row.priority_expires_at) : null;
-  const priorityRemainingHours = priorityExpiresAt && priorityExpiresAt.getTime() > Date.now()
-    ? Math.ceil((priorityExpiresAt.getTime() - Date.now()) / (60 * 60 * 1000))
-    : 0;
-  return {
-    ...row,
-    status: effectiveStatus,
-    days_remaining: row.expires_at ? computeRemainingDays(row.expires_at) : null,
-    is_prioritized: priorityRemainingHours > 0 && Number(row.priority_amount_kes) > 0,
-    priority_remaining_hours: priorityRemainingHours,
-  };
-}
-
-async function expireOverdueListings() {
+async function addSellerNotification(sellerId, message) {
+  if (!sellerId || !message) return;
   await db.execute({
-    sql: `UPDATE listings
-          SET status = 'expired', priority_amount_kes = 0, priority_expires_at = NULL, priority_plan_name = NULL
-          WHERE expires_at IS NOT NULL
-            AND expires_at <= CURRENT_TIMESTAMP
-            AND status NOT IN ('expired', 'unsafe_removed')`,
-    args: [],
+    sql: "INSERT INTO seller_notifications (id, seller_id, message, created_at) VALUES (?, ?, ?, ?)",
+    args: [crypto.randomUUID(), sellerId, message, new Date().toISOString()],
   });
 }
 
-async function addSellerNotification(userId, message) {
+async function addPaymentNotification({ sellerId, payerName, payerPhone, payerEmail, purpose, amountKes, paymentRef }) {
   await db.execute({
-    sql: `INSERT INTO seller_notifications (id, user_id, message) VALUES (?, ?, ?)`,
-    args: [crypto.randomUUID(), userId, message],
-  });
-}
-
-async function addAdminPaymentNotification({ payerId, payerName, payerEmail, payerPhone, amountKes, purpose, reference }) {
-  await db.execute({
-    sql: `INSERT INTO admin_payment_notifications (id, payer_id, payer_name, payer_email, payer_phone, amount_kes, purpose, payment_ref)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    sql: `INSERT INTO payment_notifications
+      (id, seller_id, payer_name, payer_phone, payer_email, purpose, amount_kes, payment_ref, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
       crypto.randomUUID(),
-      payerId || null,
-      payerName || "Unknown Payer",
-      payerEmail || "",
+      sellerId || null,
+      payerName || "Seller",
       payerPhone || "",
-      Number(amountKes || 0),
+      payerEmail || "",
       purpose,
-      reference || "PAYHERO",
+      Number(amountKes || 0),
+      paymentRef || "",
+      new Date().toISOString(),
     ],
   });
 }
 
-async function requireAdminKey(req, res, next) {
-  const key = req.headers["x-admin-key"] || req.query.admin_key;
-  if (key && key === ADMIN_SECRET) return next();
-
-  const subToken = req.headers["x-sub-admin-session"];
-  if (subToken) {
-    const r = await db.execute({ sql: `SELECT session_token_hash, session_expires_at FROM admin_sub_accounts WHERE id = 'primary'` });
-    if (r.rows.length > 0) {
-      const account = serializeRows(r.rows)[0];
-      if (!account.session_expires_at || new Date(account.session_expires_at).getTime() <= Date.now()) {
-        return res.status(401).json({ ok: false, error: "Sub-admin session expired." });
-      }
-      if (hashToken(String(subToken)) === account.session_token_hash) return next();
+function validateAllPostFieldsRequired(payload) {
+  const requiredCommon = ["category", "price_kes", "negotiable", "town", "description"];
+  for (const field of requiredCommon) {
+    if (payload[field] === undefined || payload[field] === null || String(payload[field]).trim() === "") {
+      return `Missing required field: ${field}`;
     }
   }
-  return res.status(401).json({ ok: false, error: "Invalid Admin Portal authentication." });
-}
-
-async function ensureUsersAndListingsColumns() {
-  const userInfo = await db.execute(`PRAGMA table_info(users)`);
-  if (userInfo.rows.length > 0) {
-    const existingCols = new Set(userInfo.rows.map((r) => String(r.name)));
-    const columnsToAdd = [
-      ["phone", "TEXT NOT NULL DEFAULT ''"],
-      ["email", "TEXT"],
-      ["password_hash", "TEXT"],
-      ["whatsapp_phone", "TEXT NOT NULL DEFAULT ''"],
-      ["call_phone", "TEXT NOT NULL DEFAULT ''"],
-      ["role", "TEXT DEFAULT 'private'"],
-      ["shop_slug", "TEXT"],
-      ["town", "TEXT DEFAULT 'Nakuru'"],
-      ["free_posts_used", "INTEGER DEFAULT 0"],
-      ["paid_post_credits", "INTEGER DEFAULT 0"],
-      ["is_suspended", "INTEGER DEFAULT 0"],
-      ["suspension_reason", "TEXT"],
-      ["appeal_text", "TEXT"],
-      ["appeal_status", "TEXT DEFAULT 'none'"],
-      ["appeal_count", "INTEGER DEFAULT 0"],
-      ["firebase_uid", "TEXT"],
-      ["appeal_response", "TEXT"],
-      ["agent_of", "TEXT"],
+  if (!Array.isArray(payload.photos) || payload.photos.length < 1 || payload.photos.length > 6) {
+    return "Please provide between 1 and 6 photos.";
+  }
+  if (payload.category === "motor") {
+    const motorFields = [
+      "vehicle_type", "condition_type", "brand", "model", "body_type",
+      "year", "reg_number", "fuel_type", "transmission", "drive_type",
+      "air_con", "engine_cc", "mileage_km"
     ];
-    for (const [colName, colDef] of columnsToAdd) {
-      if (!existingCols.has(colName)) {
-        await db.execute(`ALTER TABLE users ADD COLUMN ${colName} ${colDef}`);
+    for (const field of motorFields) {
+      if (payload[field] === undefined || payload[field] === null || String(payload[field]).trim() === "") {
+        return `Missing required motor field: ${field}`;
       }
     }
-    await db.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL`);
-    await db.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_shop_slug ON users(shop_slug) WHERE shop_slug IS NOT NULL`);
-  }
-
-  const listInfo = await db.execute(`PRAGMA table_info(listings)`);
-  if (listInfo.rows.length > 0) {
-    const existingListCols = new Set(listInfo.rows.map((r) => String(r.name)));
-    if (!existingListCols.has("is_paid_post")) {
-      await db.execute(`ALTER TABLE listings ADD COLUMN is_paid_post INTEGER DEFAULT 0`);
-    }
-    if (!existingListCols.has("expires_at")) {
-      await db.execute(`ALTER TABLE listings ADD COLUMN expires_at DATETIME`);
-    }
-    if (!existingListCols.has("priority_plan_name")) {
-      await db.execute(`ALTER TABLE listings ADD COLUMN priority_plan_name TEXT`);
-    }
-    if (!existingListCols.has("whatsapp_phone")) {
-      await db.execute(`ALTER TABLE listings ADD COLUMN whatsapp_phone TEXT`);
-    }
-    if (!existingListCols.has("call_phone")) {
-      await db.execute(`ALTER TABLE listings ADD COLUMN call_phone TEXT`);
-    }
-  }
-
-  const resetInfo = await db.execute(`PRAGMA table_info(password_resets)`);
-  const resetCols = new Set(resetInfo.rows.map((row) => String(row.name)));
-  if (!resetCols.has("attempts")) {
-    await db.execute(`ALTER TABLE password_resets ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`);
-  }
-}
-
-let dbInitPromise = null;
-
-async function initDatabase() {
-  const ddl = [
-    `CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      phone TEXT NOT NULL DEFAULT '',
-      email TEXT UNIQUE,
-      password_hash TEXT,
-      whatsapp_phone TEXT NOT NULL DEFAULT '',
-      call_phone TEXT NOT NULL DEFAULT '',
-      role TEXT CHECK(role IN ('private', 'dealer')) DEFAULT 'private',
-      shop_slug TEXT UNIQUE,
-      town TEXT DEFAULT 'Nakuru',
-      free_posts_used INTEGER DEFAULT 0,
-      paid_post_credits INTEGER DEFAULT 0,
-      is_suspended INTEGER DEFAULT 0,
-      suspension_reason TEXT,
-      appeal_text TEXT,
-      appeal_status TEXT DEFAULT 'none',
-      appeal_count INTEGER DEFAULT 0,
-      firebase_uid TEXT,
-      appeal_response TEXT,
-      agent_of TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS admin_sub_accounts (
-      id TEXT PRIMARY KEY,
-      email TEXT UNIQUE,
-      password_hash TEXT NOT NULL,
-      two_factor_enabled INTEGER DEFAULT 0,
-      code_hash TEXT,
-      code_expires_at DATETIME,
-      code_used_at DATETIME,
-      session_token_hash TEXT,
-      session_expires_at DATETIME,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS password_resets (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      token_hash TEXT UNIQUE NOT NULL,
-      expires_at DATETIME NOT NULL,
-      used_at DATETIME,
-      attempts INTEGER NOT NULL DEFAULT 0,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS whatsapp_phone_registry (
-      phone_key TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL
-    )`,
-    `CREATE TABLE IF NOT EXISTS seller_notifications (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      message TEXT NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS admin_payment_notifications (
-      id TEXT PRIMARY KEY,
-      payer_id TEXT,
-      payer_name TEXT NOT NULL,
-      payer_email TEXT,
-      payer_phone TEXT,
-      amount_kes INTEGER NOT NULL,
-      purpose TEXT NOT NULL,
-      payment_ref TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
-    `CREATE TABLE IF NOT EXISTS post_plans (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      post_count INTEGER NOT NULL,
-      price_kes INTEGER NOT NULL,
-      active INTEGER DEFAULT 1
-    )`,
-    `CREATE TABLE IF NOT EXISTS priority_plans (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      duration_hours INTEGER NOT NULL,
-      price_kes INTEGER NOT NULL,
-      active INTEGER DEFAULT 1
-    )`,
-    `CREATE TABLE IF NOT EXISTS post_purchases (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      plan_name TEXT NOT NULL,
-      posts_added INTEGER NOT NULL,
-      amount_kes INTEGER NOT NULL,
-      payment_ref TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS vehicle_catalog (
-      id TEXT PRIMARY KEY,
-      vehicle_type TEXT NOT NULL,
-      brand TEXT NOT NULL,
-      model TEXT NOT NULL,
-      body_type TEXT NOT NULL
-    )`,
-    `CREATE TABLE IF NOT EXISTS listings (
-      id TEXT PRIMARY KEY,
-      seller_id TEXT NOT NULL,
-      category TEXT CHECK(category IN ('motor', 'part')) NOT NULL,
-      title TEXT NOT NULL,
-      price_kes INTEGER NOT NULL,
-      negotiable TEXT CHECK(negotiable IN ('Yes', 'No')) DEFAULT 'Yes',
-      town TEXT NOT NULL,
-      description TEXT,
-      vehicle_type TEXT,
-      reg_number TEXT,
-      condition_type TEXT,
-      brand TEXT,
-      model TEXT,
-      body_type TEXT,
-      year INTEGER,
-      fuel_type TEXT,
-      transmission TEXT,
-      drive_type TEXT,
-      air_con TEXT,
-      engine_cc INTEGER,
-      mileage_km INTEGER,
-      part_name TEXT,
-      part_make TEXT,
-      part_model TEXT,
-      year_from INTEGER,
-      year_to INTEGER,
-      part_condition TEXT,
-      part_authenticity TEXT,
-      is_paid_post INTEGER DEFAULT 0,
-      expires_at DATETIME,
-      status TEXT CHECK(status IN ('pending_approval', 'active', 'paused', 'reported_suspended', 'unsafe_removed', 'expired', 'sold')) DEFAULT 'pending_approval',
-      report_reason TEXT,
-      reported_at DATETIME,
-      priority_amount_kes INTEGER DEFAULT 0,
-      priority_expires_at DATETIME,
-      views_count INTEGER DEFAULT 0,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS listing_photos (
-      id TEXT PRIMARY KEY,
-      listing_id TEXT NOT NULL,
-      photo_data TEXT NOT NULL,
-      sort_order INTEGER DEFAULT 0
-    )`,
-    `CREATE INDEX IF NOT EXISTS idx_listings_status ON listings(status, category, town, price_kes)`,
-    `CREATE INDEX IF NOT EXISTS idx_listings_seller ON listings(seller_id)`,
-    `CREATE INDEX IF NOT EXISTS idx_resets_token ON password_resets(token_hash)`,
-  ];
-
-  for (const sql of ddl) {
-    await db.execute(sql);
-  }
-
-  await ensureUsersAndListingsColumns();
-
-  await db.execute({
-    sql: `INSERT OR IGNORE INTO settings (key, value) VALUES ('base_priority_price_kes', '300')`,
-    args: [],
-  });
-  await db.execute({
-    sql: `INSERT OR IGNORE INTO settings (key, value) VALUES ('max_daily_priority_slots', '20')`,
-    args: [],
-  });
-
-  const priorityPlanCount = await db.execute(`SELECT COUNT(*) AS cnt FROM priority_plans`);
-  if (Number(priorityPlanCount.rows[0].cnt) === 0) {
-    await db.execute({
-      sql: `INSERT INTO priority_plans (id, name, duration_hours, price_kes) VALUES (?, ?, ?, ?)`,
-      args: [crypto.randomUUID(), "24 Hours", 24, 300],
-    });
-  }
-
-  const plansCnt = await db.execute(`SELECT COUNT(*) AS cnt FROM post_plans`);
-  if (Number(plansCnt.rows[0].cnt) === 0) {
-    await db.execute({
-      sql: `INSERT INTO post_plans (id, name, post_count, price_kes) VALUES ('plan_starter', 'Starter', 10, 200)`,
-      args: [],
-    });
-    await db.execute({
-      sql: `INSERT INTO post_plans (id, name, post_count, price_kes) VALUES ('plan_pro', 'Pro 25', 25, 500)`,
-      args: [],
-    });
-  }
-
-  const catCnt = await db.execute(`SELECT COUNT(*) AS cnt FROM vehicle_catalog`);
-  if (Number(catCnt.rows[0].cnt) === 0) {
-    const seed = [
-      ["Car", "Toyota", "Fielder", "Station Wagon"],
-      ["Car", "Toyota", "Harrier", "SUV"],
-      ["Car", "Toyota", "Premio", "Saloon"],
-      ["Car", "Toyota", "Vitz", "Hatchback"],
-      ["Car", "Toyota", "Land Cruiser Prado", "SUV"],
-      ["Truck", "Toyota", "Hilux", "Pickup/Truck"],
-      ["Car", "Audi", "A4", "Saloon"],
-      ["Car", "Audi", "Q5", "SUV"],
-      ["Car", "Mazda", "CX-5", "SUV"],
-      ["Car", "Mazda", "Demio", "Hatchback"],
-      ["Car", "Subaru", "Forester", "SUV"],
-      ["Car", "Nissan", "X-Trail", "SUV"],
-      ["Truck", "Isuzu", "D-Max", "Pickup/Truck"],
-      ["Bike", "Boxer", "BM150", "Motorbike"],
+  } else if (payload.category === "part") {
+    const partFields = [
+      "part_name", "part_make", "part_model", "year_from",
+      "year_to", "part_condition", "part_authenticity"
     ];
-    for (const [vt, br, mo, bo] of seed) {
-      await db.execute({
-        sql: `INSERT INTO vehicle_catalog (id, vehicle_type, brand, model, body_type) VALUES (?, ?, ?, ?, ?)`,
-        args: [crypto.randomUUID(), vt, br, mo, bo],
-      });
+    for (const field of partFields) {
+      if (payload[field] === undefined || payload[field] === null || String(payload[field]).trim() === "") {
+        return `Missing required spare part field: ${field}`;
+      }
     }
+  } else {
+    return "Invalid category.";
   }
-
-  const listCnt = await db.execute(`SELECT COUNT(*) AS cnt FROM listings`);
-  if (Number(listCnt.rows[0].cnt) === 0) {
-    await db.execute({
-      sql: `INSERT OR IGNORE INTO users (id, name, phone, email, password_hash, whatsapp_phone, call_phone, role, shop_slug, town, free_posts_used)
-            VALUES ('usr_rift_dealer', 'Rift Valley Motors Nakuru', '0712345678', 'sales@riftmotors.co.ke', NULL, '254712345678', '0712345678', 'dealer', 'rift-valley-motors', 'Nakuru', 2)`,
-      args: [],
-    });
-    await db.execute({
-      sql: `INSERT INTO listings (
-        id, seller_id, category, title, price_kes, negotiable, town, description,
-        vehicle_type, reg_number, condition_type, brand, model, body_type, year,
-        fuel_type, transmission, drive_type, air_con, engine_cc, mileage_km,
-        is_paid_post, expires_at, status, priority_amount_kes, priority_expires_at
-      ) VALUES (
-        'car_sample_1', 'usr_rift_dealer', 'motor', '2018 Toyota Harrier Elegance', 3150000, 'Yes', 'Nakuru',
-        'Clean direct import in Nakuru. Call or WhatsApp seller directly.',
-        'Car', 'KDN 412B', 'Import', 'Toyota', 'Harrier', 'SUV', 2018,
-        'Petrol', 'Automatic', 'Right', 'Yes', 2000, 68000,
-        0, NULL, 'active', 450, ?
-      )`,
-      args: [new Date(Date.now() + 24 * 3600 * 1000).toISOString()],
-    });
-    await db.execute({
-      sql: `INSERT INTO listing_photos (id, listing_id, photo_data, sort_order) VALUES (?, 'car_sample_1', ?, 0)`,
-      args: [
-        crypto.randomUUID(),
-        "https://images.unsplash.com/photo-1549317661-bd32c8ce0db2?auto=format&fit=crop&w=900&q=75",
-      ],
-    });
-  }
-
-  await db.execute(`DELETE FROM whatsapp_phone_registry`);
-  const usersForPhoneRegistry = await db.execute(`SELECT id, whatsapp_phone FROM users WHERE whatsapp_phone != ''`);
-  for (const user of serializeRows(usersForPhoneRegistry.rows)) {
-    const phoneKey = phoneRegistryKey(user.whatsapp_phone);
-    if (phoneKey) {
-      await db.execute({
-        sql: `INSERT OR IGNORE INTO whatsapp_phone_registry (phone_key, user_id) VALUES (?, ?)`,
-        args: [phoneKey, user.id],
-      });
-    }
-  }
+  return null;
 }
 
-function ensureDbReady() {
-  if (!dbInitPromise) {
-    dbInitPromise = initDatabase().catch((err) => {
-      dbInitPromise = null;
-      throw err;
-    });
+function buildListingTitle(payload) {
+  if (payload.category === "motor") {
+    return `${payload.year} ${payload.brand} ${payload.model}`.trim();
   }
-  return dbInitPromise;
+  return `${payload.part_name} (${payload.part_make} ${payload.part_model})`.trim();
 }
 
-app.use("/api", async (req, res, next) => {
+function sanitizeUser(u) {
+  if (!u) return null;
+  const copy = { ...u };
+  delete copy.password_hash;
+  copy.is_suspended = Boolean(copy.is_suspended);
+  return copy;
+}
+
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "Wariara Cars Central Rift API (Turso)",
+    emailjsConfigured: Boolean(EMAILJS_PUBLIC_KEY && EMAILJS_PRIVATE_KEY),
+  });
+});
+
+// ================= PUBLIC META & DEALERS =================
+
+app.get("/api/meta", async (req, res) => {
   try {
-    await ensureDbReady();
-    await expireOverdueListings();
-    next();
+    const [catalogRes, plansRes, settingsRes] = await Promise.all([
+      db.execute("SELECT * FROM vehicle_catalog ORDER BY brand ASC"),
+      db.execute("SELECT * FROM post_plans ORDER BY price_kes ASC"),
+      db.execute("SELECT * FROM platform_settings"),
+    ]);
+
+    const settings = {};
+    for (const r of rowsToArray(settingsRes)) {
+      settings[r.key] = r.value;
+    }
+
+    res.json({
+      catalog: rowsToArray(catalogRes),
+      plans: rowsToArray(plansRes),
+      settings,
+      emailjsPublicKey: EMAILJS_PUBLIC_KEY,
+    });
   } catch (err) {
-    res.status(500).json({ ok: false, error: `Database initialization error: ${err.message}` });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ==========================================
-// HEALTH & API ROOT
-// ==========================================
-app.get("/", (req, res) => {
-  res.json({ ok: true, service: "wariara-cars-central-rift-api", mode: "api" });
-});
-
-app.get("/api/health", async (req, res) => {
+app.get("/api/dealers", async (req, res) => {
   try {
-    const ping = await db.execute("SELECT 1 AS ok");
-    res.json({ ok: true, service: "wariara-cars-central-rift-api", db: serializeRows(ping.rows)[0] });
+    const [usersRes, listingsRes] = await Promise.all([
+      db.execute("SELECT id, name, town, role, shop_slug, whatsapp_phone, call_phone, is_suspended FROM users WHERE role = 'dealer'"),
+      db.execute("SELECT seller_id, status FROM listings WHERE status = 'active'"),
+    ]);
+
+    const activeCountBySeller = {};
+    for (const l of rowsToArray(listingsRes)) {
+      activeCountBySeller[l.seller_id] = (activeCountBySeller[l.seller_id] || 0) + 1;
+    }
+
+    const dealers = rowsToArray(usersRes)
+      .filter((u) => !Number(u.is_suspended))
+      .map((u) => ({
+        id: u.id,
+        name: u.name,
+        town: u.town,
+        role: u.role,
+        shop_slug: u.shop_slug || slugify(u.name),
+        whatsapp_phone: u.whatsapp_phone,
+        call_phone: u.call_phone,
+        active_listings: activeCountBySeller[u.id] || 0,
+      }));
+
+    res.json({ dealers });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ==========================================
-// SELLER ACCOUNT, PASSWORD CONFIRMATION & ONE-TIME RESET TOKEN API
-// ==========================================
+// ================= SELLER ACCOUNTS & AUTH =================
+
 app.post("/api/sellers/account", async (req, res) => {
   try {
     const {
@@ -560,96 +443,59 @@ app.post("/api/sellers/account", async (req, res) => {
       call_phone,
       role = "private",
       town = "Nakuru",
-      firebase_uid,
+      accepted_terms,
     } = req.body;
 
-    if (!name || !email || !whatsapp_phone || !call_phone) {
-      return res.status(400).json({
-        error: "Name, email, WhatsApp number, and phone call number are required.",
-      });
+    if (!name || !email || !whatsapp_phone || !call_phone || !password) {
+      return res.status(400).json({ error: "Name, email, WhatsApp, call phone, and password are required." });
     }
-    if (!password || password.length < 6) {
+    if (accepted_terms !== true && accepted_terms !== "true") {
+      return res.status(400).json({ error: "You must accept the Terms and Conditions to create an account." });
+    }
+    if (String(password).length < 6) {
       return res.status(400).json({ error: "Password must be at least 6 characters." });
     }
-    if (password !== confirm_password) {
-      return res.status(400).json({ error: "Passwords do not match. Enter the same password twice." });
+    if (confirm_password !== undefined && password !== confirm_password) {
+      return res.status(400).json({ error: "Passwords do not match." });
     }
 
-    const cleanEmail = email.trim().toLowerCase();
-    const cleanPhone = (call_phone || whatsapp_phone).trim();
-    const existing = await db.execute({ sql: `SELECT * FROM users WHERE email = ?`, args: [cleanEmail] });
-
-    if (existing.rows.length > 0) {
-      return res.status(409).json({
-        error: "An account with this email already exists. Sign in or use Forgot Password.",
-      });
-    }
-
-    const normalizedWhatsApp = normalizeKenyanPhone(whatsapp_phone);
-    const phoneKey = phoneRegistryKey(normalizedWhatsApp);
-    if (!phoneKey) return res.status(400).json({ error: "Enter a valid WhatsApp number." });
-    const registeredPhone = await db.execute({
-      sql: `SELECT user_id FROM whatsapp_phone_registry WHERE phone_key = ?`,
-      args: [phoneKey],
+    const cleanEmail = String(email).trim().toLowerCase();
+    const existingRes = await db.execute({
+      sql: "SELECT * FROM users WHERE email = ?",
+      args: [cleanEmail],
     });
-    if (registeredPhone.rows.length > 0) {
-      return res.status(409).json({ error: "This WhatsApp number is already used by another account." });
+    if (rowToObj(existingRes)) {
+      return res.status(409).json({ error: "An account with this email already exists. Please sign in instead." });
     }
 
     const id = crypto.randomUUID();
-    const safeRole = role === "dealer" ? "dealer" : "private";
-    const slug =
-      name
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/(^-|-$)/g, "") +
-      "-" +
-      id.slice(0, 4);
-    const passwordHash = hashPassword(password);
+    const cleanRole = role === "dealer" ? "dealer" : "private";
+    const cleanTown = String(town).trim() || "Nakuru";
+    const shopSlug = slugify(name);
+    const nowIso = new Date().toISOString();
 
-    try {
-      await db.execute({
-        sql: `INSERT INTO whatsapp_phone_registry (phone_key, user_id) VALUES (?, ?)`,
-        args: [phoneKey, id],
-      });
-    } catch (err) {
-      if (String(err.message).includes("UNIQUE constraint failed")) {
-        return res.status(409).json({ error: "This WhatsApp number is already used by another account." });
-      }
-      throw err;
-    }
+    await db.execute({
+      sql: `INSERT INTO users
+        (id, name, email, password_hash, whatsapp_phone, call_phone, role, town, shop_slug,
+         free_posts_used, paid_post_credits, total_purchased_posts, total_spent_kes, is_suspended, terms_accepted_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?)`,
+      args: [
+        id,
+        String(name).trim(),
+        cleanEmail,
+        hashPassword(password),
+        String(whatsapp_phone).trim(),
+        String(call_phone).trim(),
+        cleanRole,
+        cleanTown,
+        shopSlug,
+        nowIso,
+        nowIso,
+      ],
+    });
 
-    try {
-      await db.execute({
-        sql: `INSERT INTO users (id, name, phone, email, password_hash, whatsapp_phone, call_phone, role, shop_slug, town)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        args: [
-          id,
-          name.trim(),
-          cleanPhone,
-          cleanEmail,
-          passwordHash,
-          normalizedWhatsApp,
-          call_phone.trim(),
-          safeRole,
-          slug,
-          town,
-        ],
-      });
-    } catch (err) {
-      await db.execute({
-        sql: `DELETE FROM whatsapp_phone_registry WHERE phone_key = ? AND user_id = ?`,
-        args: [phoneKey, id],
-      });
-      throw err;
-    }
-
-    if (firebase_uid) {
-      await db.execute({ sql: `UPDATE users SET firebase_uid = ? WHERE id = ?`, args: [String(firebase_uid), id] });
-    }
-    await addSellerNotification(id, "Account created. You have 6 free posts available.");
-    const created = await db.execute({ sql: `SELECT * FROM users WHERE id = ?`, args: [id] });
-    res.status(201).json({ user: sanitizeUser(serializeRows(created.rows)[0]) });
+    const createdRes = await db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [id] });
+    res.json({ user: sanitizeUser(rowToObj(createdRes)) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -657,205 +503,95 @@ app.post("/api/sellers/account", async (req, res) => {
 
 app.post("/api/sellers/login", async (req, res) => {
   try {
-    const { email, password, firebase_uid } = req.body;
-    if (!email) return res.status(400).json({ error: "Email is required." });
-    const cleanEmail = email.trim().toLowerCase();
-    const r = await db.execute({ sql: `SELECT * FROM users WHERE email = ?`, args: [cleanEmail] });
-    if (r.rows.length === 0) return res.status(404).json({ error: "Seller account not found." });
-    const user = serializeRows(r.rows)[0];
-    if (firebase_uid) {
-      if (user.firebase_uid && user.firebase_uid !== String(firebase_uid)) {
-        return res.status(401).json({ error: "This Firebase account does not match the seller account." });
-      }
-      await db.execute({ sql: `UPDATE users SET firebase_uid = ? WHERE id = ?`, args: [String(firebase_uid), user.id] });
-      const updated = await db.execute({ sql: `SELECT * FROM users WHERE id = ?`, args: [user.id] });
-      return res.json({ user: sanitizeUser(serializeRows(updated.rows)[0]) });
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email and password are required." });
     }
-    if (!password) return res.status(400).json({ error: "Password is required." });
-    if (!user.password_hash) {
-      return res.status(400).json({ error: "No password is set on this account yet. Use Forgot Password to set one." });
-    }
-    if (!verifyPassword(password, user.password_hash)) {
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const userRes = await db.execute({ sql: "SELECT * FROM users WHERE email = ?", args: [cleanEmail] });
+    const user = rowToObj(userRes);
+
+    if (!user || !verifyPassword(password, user.password_hash)) {
       return res.status(401).json({ error: "Invalid email or password." });
     }
+
     res.json({ user: sanitizeUser(user) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/api/sellers/forgot-password/code", async (req, res) => {
+app.post("/api/sellers/forgot-password/token", async (req, res) => {
   try {
     const { email } = req.body;
-    if (!email) return res.status(400).json({ error: "Enter your account email address." });
-    const cleanEmail = email.trim().toLowerCase();
-    const r = await db.execute({ sql: `SELECT * FROM users WHERE email = ?`, args: [cleanEmail] });
-    if (r.rows.length === 0) {
-      return res.json({ message: "If an account exists for that email, a reset code has been sent." });
+    if (!email) return res.status(400).json({ error: "Email is required." });
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const userRes = await db.execute({
+      sql: "SELECT id, name, email FROM users WHERE email = ?",
+      args: [cleanEmail],
+    });
+    const user = rowToObj(userRes);
+
+    if (!user) {
+      return res.status(404).json({ error: "No seller account found with that email." });
     }
-    const user = serializeRows(r.rows)[0];
+
+    const token = crypto.randomBytes(24).toString("hex");
+    const expiresAt = new Date(Date.now() + 1000 * 60 * 60).toISOString();
 
     await db.execute({
-      sql: `UPDATE password_resets SET used_at = CURRENT_TIMESTAMP WHERE user_id = ? AND used_at IS NULL`,
-      args: [user.id],
+      sql: "INSERT INTO password_reset_tokens (id, user_id, token, expires_at, used, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+      args: [crypto.randomUUID(), user.id, token, expiresAt, new Date().toISOString()],
     });
 
-    const resetCode = String(crypto.randomInt(100000, 1000000));
-    const tokenHash = hashToken(resetCode);
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-
-    await db.execute({
-      sql: `INSERT INTO password_resets (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)`,
-      args: [crypto.randomUUID(), user.id, tokenHash, expiresAt],
-    });
-
-    const publicKey = process.env.EMAILJS_PUBLIC_KEY;
-    const privateKey = process.env.EMAILJS_PRIVATE_KEY;
-    if (!publicKey || !privateKey) {
-      await db.execute({
-        sql: `UPDATE password_resets SET used_at = CURRENT_TIMESTAMP WHERE token_hash = ? AND used_at IS NULL`,
-        args: [tokenHash],
-      });
-      return res.status(503).json({ error: "Password reset email is not configured. Please contact support." });
-    }
-
-    const mailResponse = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        service_id: EMAILJS_SERVICE_ID,
-        template_id: EMAILJS_TEMPLATE_ID,
-        user_id: publicKey,
-        accessToken: privateKey,
-        template_params: {
-          to_email: cleanEmail,
-          to_name: user.name,
-          name: "Wariara Cars Central Rift",
-          from_name: "Wariara Cars Central Rift",
-          subject: "Your Wariara Cars password reset code",
-          message: `Your password reset code is ${resetCode}. It is valid for 10 minutes. If you did not request this, you can ignore this email.`,
-          reset_code: resetCode,
-          code_expiry_minutes: "10",
-        },
-      }),
-    });
-    if (!mailResponse.ok) {
-      const providerMessage = await mailResponse.text();
-      await db.execute({
-        sql: `UPDATE password_resets SET used_at = CURRENT_TIMESTAMP WHERE token_hash = ? AND used_at IS NULL`,
-        args: [tokenHash],
-      });
-      console.error("Password reset email delivery failed:", mailResponse.status, providerMessage);
-      return res.status(502).json({ error: "Could not send the reset email. Please try again later." });
-    }
-
-    res.json({ message: "If an account exists for that email, a 6-digit reset code has been sent. It expires in 10 minutes." });
+    res.json({ token, email: user.email, name: user.name });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/api/sellers/forgot-password/verify", async (req, res) => {
-  try {
-    const { email, code } = req.body;
-    if (!email || !code) return res.status(400).json({ error: "Enter your account email and reset code." });
-    const userResult = await db.execute({
-      sql: `SELECT id FROM users WHERE email = ?`,
-      args: [String(email).trim().toLowerCase()],
-    });
-    if (userResult.rows.length === 0) return res.status(400).json({ error: "Invalid or expired reset code." });
-
-    const userId = String(userResult.rows[0].id);
-    const resetResult = await db.execute({
-      sql: `SELECT * FROM password_resets WHERE user_id = ? AND used_at IS NULL ORDER BY created_at DESC, rowid DESC LIMIT 1`,
-      args: [userId],
-    });
-    if (resetResult.rows.length === 0) return res.status(400).json({ error: "Invalid or expired reset code." });
-    const reset = serializeRows(resetResult.rows)[0];
-    if (Number(reset.attempts) >= 5 || new Date(reset.expires_at).getTime() <= Date.now()) {
-      await db.execute({
-        sql: `UPDATE password_resets SET used_at = CURRENT_TIMESTAMP WHERE id = ? AND used_at IS NULL`,
-        args: [reset.id],
-      });
-      return res.status(400).json({ error: "Invalid or expired reset code. Request a new code." });
-    }
-
-    const submittedHash = hashToken(String(code).trim());
-    const expectedHash = Buffer.from(String(reset.token_hash), "hex");
-    const actualHash = Buffer.from(submittedHash, "hex");
-    if (expectedHash.length !== actualHash.length || !crypto.timingSafeEqual(expectedHash, actualHash)) {
-      await db.execute({
-        sql: `UPDATE password_resets SET attempts = attempts + 1,
-              used_at = CASE WHEN attempts + 1 >= 5 THEN CURRENT_TIMESTAMP ELSE used_at END
-              WHERE id = ? AND used_at IS NULL`,
-        args: [reset.id],
-      });
-      return res.status(400).json({ error: "Invalid or expired reset code." });
-    }
-
-    const consumed = await db.execute({
-      sql: `UPDATE password_resets SET used_at = CURRENT_TIMESTAMP WHERE id = ? AND used_at IS NULL AND attempts < 5`,
-      args: [reset.id],
-    });
-    if (Number(consumed.rowsAffected || 0) === 0) {
-      return res.status(400).json({ error: "Invalid or expired reset code." });
-    }
-
-    const resetToken = crypto.randomBytes(32).toString("hex");
-    await db.execute({
-      sql: `INSERT INTO password_resets (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)`,
-      args: [
-        crypto.randomUUID(),
-        userId,
-        hashToken(resetToken),
-        new Date(Date.now() + 10 * 60 * 1000).toISOString(),
-      ],
-    });
-    res.json({ reset_token: resetToken });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Consumes the verified reset token once so it can never be reused.
 app.post("/api/sellers/reset-password", async (req, res) => {
   try {
     const { token, password, confirm_password } = req.body;
-    if (!token || !password || !confirm_password) {
-      return res.status(400).json({ error: "Reset token, new password, and confirmation are required." });
+    if (!token || !password) {
+      return res.status(400).json({ error: "Reset token and new password are required." });
     }
-    if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters." });
-    if (password !== confirm_password) return res.status(400).json({ error: "Passwords do not match." });
-
-    const tokenHash = hashToken(String(token).trim());
-    const r = await db.execute({ sql: `SELECT * FROM password_resets WHERE token_hash = ?`, args: [tokenHash] });
-    if (r.rows.length === 0) return res.status(400).json({ error: "Invalid password reset token." });
-
-    const resetRow = serializeRows(r.rows)[0];
-    if (resetRow.used_at) {
-      return res.status(400).json({ error: "This reset token has already been used and cannot be reused." });
+    if (String(password).length < 6) {
+      return res.status(400).json({ error: "Password must be at least 6 characters." });
     }
-    if (new Date(resetRow.expires_at).getTime() <= Date.now()) {
-      return res.status(400).json({ error: "This reset token has expired. Request a new code." });
+    if (confirm_password !== undefined && password !== confirm_password) {
+      return res.status(400).json({ error: "New passwords do not match." });
     }
 
-    const consumed = await db.execute({
-      sql: `UPDATE password_resets SET used_at = CURRENT_TIMESTAMP WHERE id = ? AND used_at IS NULL`,
-      args: [resetRow.id],
+    const tokenRes = await db.execute({
+      sql: "SELECT * FROM password_reset_tokens WHERE token = ?",
+      args: [String(token).trim()],
     });
-    if (Number(consumed.rowsAffected || 0) === 0) {
-      return res.status(400).json({ error: "This reset token has already been used." });
+    const resetRow = rowToObj(tokenRes);
+
+    if (!resetRow || Number(resetRow.used)) {
+      return res.status(400).json({ error: "This reset link is invalid or has already been used." });
+    }
+    if (new Date(resetRow.expires_at).getTime() < Date.now()) {
+      return res.status(400).json({ error: "This reset link has expired." });
     }
 
     await db.execute({
-      sql: `UPDATE users SET password_hash = ? WHERE id = ?`,
+      sql: "UPDATE users SET password_hash = ? WHERE id = ?",
       args: [hashPassword(password), resetRow.user_id],
     });
+    await db.execute({
+      sql: "UPDATE password_reset_tokens SET used = 1, used_at = ? WHERE id = ?",
+      args: [new Date().toISOString(), resetRow.id],
+    });
 
-    const updated = await db.execute({ sql: `SELECT * FROM users WHERE id = ?`, args: [resetRow.user_id] });
+    const updatedUserRes = await db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [resetRow.user_id] });
+
     res.json({
-      message: "Password updated successfully. This reset token cannot be reused.",
-      user: sanitizeUser(serializeRows(updated.rows)[0]),
+      message: "Password updated successfully. This one-time link is now expired.",
+      user: sanitizeUser(rowToObj(updatedUserRes)),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -864,12 +600,14 @@ app.post("/api/sellers/reset-password", async (req, res) => {
 
 app.get("/api/sellers/lookup", async (req, res) => {
   try {
-    const { email, seller_id } = req.query;
-    const result = seller_id
-      ? await db.execute({ sql: `SELECT * FROM users WHERE id = ?`, args: [seller_id] })
-      : await db.execute({ sql: `SELECT * FROM users WHERE email = ?`, args: [(email || "").trim().toLowerCase()] });
-    if (result.rows.length === 0) return res.status(404).json({ error: "Seller account not found." });
-    res.json({ user: sanitizeUser(serializeRows(result.rows)[0]) });
+    const { seller_id } = req.query;
+    if (!seller_id) return res.status(400).json({ error: "seller_id is required." });
+
+    const userRes = await db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [seller_id] });
+    const user = rowToObj(userRes);
+    if (!user) return res.status(404).json({ error: "Seller not found." });
+
+    res.json({ user: sanitizeUser(user) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -877,11 +615,28 @@ app.get("/api/sellers/lookup", async (req, res) => {
 
 app.get("/api/sellers/:id/notifications", async (req, res) => {
   try {
-    const r = await db.execute({
-      sql: `SELECT * FROM seller_notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 30`,
+    const notifRes = await db.execute({
+      sql: "SELECT * FROM seller_notifications WHERE seller_id = ? ORDER BY created_at DESC LIMIT 50",
       args: [req.params.id],
     });
-    res.json({ notifications: serializeRows(r.rows) });
+    res.json({ notifications: rowsToArray(notifRes) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/sellers/:id/listings", async (req, res) => {
+  try {
+    await syncExpiredListings();
+    const listRes = await db.execute({
+      sql: "SELECT * FROM listings WHERE seller_id = ? ORDER BY created_at DESC",
+      args: [req.params.id],
+    });
+    const enriched = rowsToArray(listRes).map((l) => ({
+      ...l,
+      days_remaining: computeDaysRemaining(l),
+    }));
+    res.json({ listings: enriched });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -890,92 +645,68 @@ app.get("/api/sellers/:id/notifications", async (req, res) => {
 app.post("/api/sellers/:id/appeal", async (req, res) => {
   try {
     const { appeal_text } = req.body;
-    if (!appeal_text || appeal_text.trim().length < 4) {
-      return res.status(400).json({ error: "Enter a review request message." });
+    if (!appeal_text || !String(appeal_text).trim()) {
+      return res.status(400).json({ error: "Please enter a review message." });
     }
-    const account = await db.execute({ sql: `SELECT appeal_count, is_suspended FROM users WHERE id = ?`, args: [req.params.id] });
-    if (account.rows.length === 0) return res.status(404).json({ error: "Account not found." });
-    const current = serializeRows(account.rows)[0];
-    if (!current.is_suspended) return res.status(400).json({ error: "Only suspended accounts can request review." });
-    if (Number(current.appeal_count || 0) >= 2) return res.status(429).json({ error: "You have used both review requests for this suspension." });
     await db.execute({
-      sql: `UPDATE users SET appeal_text = ?, appeal_status = 'pending', appeal_count = appeal_count + 1 WHERE id = ?`,
-      args: [appeal_text.trim(), req.params.id],
+      sql: "UPDATE users SET appeal_text = ?, appeal_status = 'pending' WHERE id = ?",
+      args: [String(appeal_text).trim(), req.params.id],
     });
-    res.json({ message: "Suspension review request sent to Admin and Admin Sub." });
+    res.json({ message: "Review request sent to Admin." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/api/sellers/:id/listings", async (req, res) => {
-  try {
-    const result = await db.execute({
-      sql: `SELECT l.*,
-              (SELECT photo_data FROM listing_photos p WHERE p.listing_id = l.id ORDER BY p.sort_order ASC LIMIT 1) AS cover_photo,
-              (SELECT COUNT(*) FROM listing_photos p WHERE p.listing_id = l.id) AS photo_count
-            FROM listings l WHERE l.seller_id = ? ORDER BY l.created_at DESC`,
-      args: [req.params.id],
-    });
-    res.json({ listings: serializeRows(result.rows).map(enrichListing) });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// ================= PLANS & LISTINGS =================
 
-// ==========================================
-// PUBLIC MARKETPLACE & PRIORITY API (APPROVED AVAILABLE POSTS)
-// ==========================================
-app.get("/api/meta", async (req, res) => {
+app.post("/api/plans/purchase", async (req, res) => {
   try {
-    const catalog = await db.execute(`SELECT * FROM vehicle_catalog ORDER BY brand ASC, model ASC`);
-    const plans = await db.execute(`SELECT * FROM post_plans WHERE active = 1 ORDER BY price_kes ASC`);
-    const priorityPlans = await db.execute(
-      `SELECT * FROM priority_plans WHERE active = 1 ORDER BY duration_hours ASC, price_kes ASC`
+    const { seller_id, plan_id, payment_ref = "", payer_phone = "" } = req.body;
+    if (!seller_id || !plan_id) {
+      return res.status(400).json({ error: "seller_id and plan_id are required." });
+    }
+
+    const [userRes, planRes] = await Promise.all([
+      db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [seller_id] }),
+      db.execute({ sql: "SELECT * FROM post_plans WHERE id = ?", args: [plan_id] }),
+    ]);
+    const user = rowToObj(userRes);
+    const plan = rowToObj(planRes);
+
+    if (!user || !plan) {
+      return res.status(404).json({ error: "Seller or plan not found." });
+    }
+
+    const newCredits = Number(user.paid_post_credits || 0) + Number(plan.post_count || 0);
+    const newTotalPurchased = Number(user.total_purchased_posts || 0) + Number(plan.post_count || 0);
+    const newTotalSpent = Number(user.total_spent_kes || 0) + Number(plan.price_kes || 0);
+
+    await db.execute({
+      sql: "UPDATE users SET paid_post_credits = ?, total_purchased_posts = ?, total_spent_kes = ? WHERE id = ?",
+      args: [newCredits, newTotalPurchased, newTotalSpent, user.id],
+    });
+
+    await addSellerNotification(
+      user.id,
+      `Purchased plan "${plan.name}" (+${plan.post_count} post credits for KES ${plan.price_kes}). Paid posts run for 70 days once published.`
     );
-    const settingsRows = await db.execute(`SELECT * FROM settings`);
-    const settings = {};
-    for (const r of settingsRows.rows) settings[r.key] = r.value;
-    res.json({
-      catalog: serializeRows(catalog.rows),
-      plans: serializeRows(plans.rows),
-      priorityPlans: serializeRows(priorityPlans.rows),
-      settings,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
-app.get("/api/priority/leaderboard", async (req, res) => {
-  try {
-    const settingsRows = await db.execute(`SELECT * FROM settings`);
-    const settings = {};
-    for (const r of settingsRows.rows) settings[r.key] = Number(r.value);
-
-    const baseFee = settings.base_priority_price_kes || 300;
-
-    const slotsRes = await db.execute({
-      sql: `SELECT l.id, l.title, l.category, l.priority_amount_kes, l.priority_expires_at,
-                   l.priority_plan_name, u.name AS seller_name
-            FROM listings l
-            JOIN users u ON u.id = l.seller_id
-            WHERE l.status = 'active' AND u.is_suspended = 0
-              AND (l.expires_at IS NULL OR l.expires_at > CURRENT_TIMESTAMP)
-              AND l.priority_amount_kes > 0 AND l.priority_expires_at > CURRENT_TIMESTAMP
-            ORDER BY l.priority_amount_kes DESC, l.priority_expires_at DESC, l.created_at DESC`,
-      args: [],
+    await addPaymentNotification({
+      sellerId: user.id,
+      payerName: user.name,
+      payerPhone: payer_phone || user.whatsapp_phone,
+      payerEmail: user.email,
+      purpose: `Post Plan: ${plan.name} (+${plan.post_count} posts, 70d lifetime)`,
+      amountKes: plan.price_kes,
+      paymentRef,
     });
 
-    const slots = serializeRows(slotsRes.rows);
-    const highestBid = slots.length > 0 ? slots[0].priority_amount_kes : 0;
+    const updatedRes = await db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [user.id] });
 
     res.json({
-      baseFee,
-      usedSlots: slots.length,
-      highestBid,
-      recommendedForTop1: baseFee,
-      leaderboard: slots,
+      message: `Added ${plan.post_count} post credits to your account.`,
+      user: sanitizeUser(rowToObj(updatedRes)),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -984,143 +715,127 @@ app.get("/api/priority/leaderboard", async (req, res) => {
 
 app.get("/api/listings", async (req, res) => {
   try {
+    await syncExpiredListings();
+
     const {
       category = "motor",
-      q,
-      vehicle_type,
-      brand,
-      model,
-      body_type,
-      town,
-      condition_type,
-      fuel_type,
-      transmission,
-      drive_type,
-      air_con,
-      part_authenticity,
-      min_price,
-      max_price,
-      min_year,
-      max_year,
-      seller_slug,
+      q = "",
+      seller = "",
+      town = "",
+      brand = "",
+      model = "",
+      min_price = "",
+      max_price = "",
+      vehicle_type = "",
+      body_type = "",
+      condition_type = "",
+      fuel_type = "",
+      transmission = "",
+      drive_type = "",
+      air_con = "",
+      min_year = "",
+      part_authenticity = "",
+      seller_slug = "",
       sort = "featured",
     } = req.query;
 
-    const where = [
-      "l.status = 'active'",
-      "u.is_suspended = 0",
-      "(l.expires_at IS NULL OR l.expires_at > CURRENT_TIMESTAMP)",
-    ];
-    const args = [];
-
-    if (category && category !== "all") {
-      where.push("l.category = ?");
-      args.push(category);
-    }
-    if (seller_slug) {
-      where.push("u.shop_slug = ?");
-      args.push(seller_slug);
-    }
-    if (q) {
-      where.push(
-        "(LOWER(l.title) LIKE ? OR LOWER(l.description) LIKE ? OR LOWER(COALESCE(l.brand,'')) LIKE ? OR LOWER(COALESCE(l.part_name,'')) LIKE ?)"
-      );
-      const t = `%${q.toLowerCase()}%`;
-      args.push(t, t, t, t);
-    }
-    if (vehicle_type) {
-      where.push("l.vehicle_type = ?");
-      args.push(vehicle_type);
-    }
-    if (brand) {
-      where.push("(LOWER(l.brand) = LOWER(?) OR LOWER(l.part_make) = LOWER(?))");
-      args.push(brand, brand);
-    }
-    if (model) {
-      where.push("(LOWER(l.model) = LOWER(?) OR LOWER(l.part_model) = LOWER(?))");
-      args.push(model, model);
-    }
-    if (body_type) {
-      where.push("l.body_type = ?");
-      args.push(body_type);
-    }
-    if (town) {
-      where.push("LOWER(l.town) = LOWER(?)");
-      args.push(town);
-    }
-    if (condition_type) {
-      where.push("(l.condition_type = ? OR l.part_condition = ?)");
-      args.push(condition_type, condition_type);
-    }
-    if (fuel_type) {
-      where.push("l.fuel_type = ?");
-      args.push(fuel_type);
-    }
-    if (transmission) {
-      where.push("l.transmission = ?");
-      args.push(transmission);
-    }
-    if (drive_type) {
-      where.push("l.drive_type = ?");
-      args.push(drive_type);
-    }
-    if (air_con) {
-      where.push("l.air_con = ?");
-      args.push(air_con);
-    }
-    if (part_authenticity) {
-      where.push("l.part_authenticity = ?");
-      args.push(part_authenticity);
-    }
-    if (min_price) {
-      where.push("l.price_kes >= ?");
-      args.push(Number(min_price));
-    }
-    if (max_price) {
-      where.push("l.price_kes <= ?");
-      args.push(Number(max_price));
-    }
-    if (min_year) {
-      where.push("(l.year >= ? OR l.year_to >= ?)");
-      args.push(Number(min_year), Number(min_year));
-    }
-    if (max_year) {
-      where.push("(l.year <= ? OR l.year_from <= ?)");
-      args.push(Number(max_year), Number(max_year));
-    }
-
-    let orderBy = `is_sponsored DESC, effective_priority DESC, seller_slot ASC, l.created_at DESC`;
-    if (sort === "newest") orderBy = `is_sponsored DESC, effective_priority DESC, l.created_at DESC`;
-    if (sort === "price_asc") orderBy = `l.price_kes ASC`;
-    if (sort === "price_desc") orderBy = `l.price_kes DESC`;
-    if (sort === "mileage_asc") orderBy = `COALESCE(l.mileage_km, 99999999) ASC`;
-    if (sort === "year_desc") orderBy = `COALESCE(l.year, l.year_to, 0) DESC`;
-
-    const sql = `
-      WITH ranked AS (
-        SELECT l.*, u.name AS seller_name, u.role AS seller_role, u.shop_slug AS seller_slug,
-               COALESCE(NULLIF(l.whatsapp_phone, ''), u.whatsapp_phone) AS effective_whatsapp_phone,
-               COALESCE(NULLIF(l.call_phone, ''), u.call_phone) AS effective_call_phone,
-               (SELECT photo_data FROM listing_photos p WHERE p.listing_id = l.id ORDER BY p.sort_order ASC LIMIT 1) AS cover_photo,
-               (SELECT COUNT(*) FROM listing_photos p WHERE p.listing_id = l.id) AS photo_count,
-               CASE WHEN l.status = 'active' AND l.priority_amount_kes > 0 AND l.priority_expires_at > CURRENT_TIMESTAMP THEN 1 ELSE 0 END AS is_sponsored,
-               CASE WHEN l.status = 'active' AND l.priority_amount_kes > 0 AND l.priority_expires_at > CURRENT_TIMESTAMP THEN l.priority_amount_kes ELSE 0 END AS effective_priority,
-               ROW_NUMBER() OVER (PARTITION BY l.seller_id ORDER BY l.created_at DESC) AS seller_slot
-        FROM listings l
-        JOIN users u ON u.id = l.seller_id
-        WHERE ${where.join(" AND ")}
-      )
-      SELECT * FROM ranked l ORDER BY ${orderBy} LIMIT 100
-    `;
-    const rows = await db.execute({ sql, args });
-    const listings = serializeRows(rows.rows).map((row) => {
-      row.whatsapp_phone = row.effective_whatsapp_phone;
-      row.call_phone = row.effective_call_phone;
-      delete row.effective_whatsapp_phone;
-      delete row.effective_call_phone;
-      return enrichListing(row);
+    const listRes = await db.execute({
+      sql: "SELECT * FROM listings WHERE status = 'active' AND category = ?",
+      args: [category],
     });
-    res.json({ listings });
+    let items = rowsToArray(listRes);
+
+    if (q) {
+      const needle = String(q).toLowerCase().trim();
+      items = items.filter((x) =>
+        [
+          x.title, x.brand, x.model, x.body_type, x.part_name,
+          x.part_make, x.part_model, x.description, x.town, x.seller_name
+        ].some((v) => String(v || "").toLowerCase().includes(needle))
+      );
+    }
+    if (seller) {
+      const sellerNeedle = String(seller).toLowerCase().trim();
+      items = items.filter((x) =>
+        [x.seller_name, x.seller_slug].some((v) => String(v || "").toLowerCase().includes(sellerNeedle))
+      );
+    }
+    if (town) items = items.filter((x) => String(x.town || "").toLowerCase() === String(town).toLowerCase());
+    if (brand) items = items.filter((x) => String(x.brand || "").toLowerCase() === String(brand).toLowerCase());
+    if (model) items = items.filter((x) => String(x.model || "").toLowerCase() === String(model).toLowerCase());
+    if (min_price) items = items.filter((x) => Number(x.price_kes) >= Number(min_price));
+    if (max_price) items = items.filter((x) => Number(x.price_kes) <= Number(max_price));
+    if (vehicle_type) items = items.filter((x) => x.vehicle_type === vehicle_type);
+    if (body_type) items = items.filter((x) => String(x.body_type || "").toLowerCase() === String(body_type).toLowerCase());
+    if (condition_type) {
+      items = items.filter((x) => (x.condition_type || x.part_condition) === condition_type);
+    }
+    if (fuel_type) items = items.filter((x) => x.fuel_type === fuel_type);
+    if (transmission) items = items.filter((x) => x.transmission === transmission);
+    if (drive_type) items = items.filter((x) => x.drive_type === drive_type);
+    if (air_con) items = items.filter((x) => x.air_con === air_con);
+    if (min_year) {
+      items = items.filter((x) => Number(x.year || x.year_from || 0) >= Number(min_year));
+    }
+    if (part_authenticity) items = items.filter((x) => x.part_authenticity === part_authenticity);
+    if (seller_slug) items = items.filter((x) => x.seller_slug === seller_slug);
+
+    const todayStr = todayKenyaDate();
+    items = items.map((x) => {
+      const isSponsoredToday =
+        String(x.priority_date || "").slice(0, 10) === todayStr &&
+        Number(x.priority_amount_kes || 0) > 0;
+      return { ...x, is_sponsored: isSponsoredToday };
+    });
+
+    if (sort === "price_asc") {
+      items.sort((a, b) => Number(a.price_kes) - Number(b.price_kes));
+    } else if (sort === "price_desc") {
+      items.sort((a, b) => Number(b.price_kes) - Number(a.price_kes));
+    } else if (sort === "mileage_asc") {
+      items.sort((a, b) => Number(a.mileage_km || 999999999) - Number(b.mileage_km || 999999999));
+    } else if (sort === "year_desc") {
+      items.sort((a, b) => Number(b.year || b.year_to || 0) - Number(a.year || a.year_to || 0));
+    } else if (sort === "newest") {
+      items.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    } else {
+      const sponsored = items
+        .filter((x) => x.is_sponsored)
+        .sort((a, b) => Number(b.priority_amount_kes) - Number(a.priority_amount_kes))
+        .slice(0, 20);
+      const sponsoredIds = new Set(sponsored.map((x) => x.id));
+      const rest = items
+        .filter((x) => !sponsoredIds.has(x.id))
+        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+      items = [...sponsored, ...rest];
+    }
+
+    const ids = items.map((x) => x.id);
+    const coverMap = {};
+    const countMap = {};
+
+    if (ids.length > 0) {
+      const placeholders = ids.map(() => "?").join(",");
+      const photosRes = await db.execute({
+        sql: `SELECT listing_id, photo_data, sort_order FROM listing_photos WHERE listing_id IN (${placeholders}) ORDER BY sort_order ASC`,
+        args: ids,
+      });
+      for (const p of rowsToArray(photosRes)) {
+        countMap[p.listing_id] = (countMap[p.listing_id] || 0) + 1;
+        if (!coverMap[p.listing_id]) {
+          coverMap[p.listing_id] = p.photo_data;
+        }
+      }
+    }
+
+    const enriched = items.map((x) => ({
+      ...x,
+      cover_photo: coverMap[x.id] || "",
+      photo_count: countMap[x.id] || 0,
+      days_remaining: computeDaysRemaining(x),
+    }));
+
+    res.json({ listings: enriched });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1128,42 +843,24 @@ app.get("/api/listings", async (req, res) => {
 
 app.get("/api/listings/:id", async (req, res) => {
   try {
-    const r = await db.execute({
-      sql: `SELECT l.*, u.name AS seller_name, u.role AS seller_role, u.shop_slug AS seller_slug,
-                   COALESCE(NULLIF(l.whatsapp_phone, ''), u.whatsapp_phone) AS effective_whatsapp_phone,
-                   COALESCE(NULLIF(l.call_phone, ''), u.call_phone) AS effective_call_phone,
-                   u.town AS seller_town
-            FROM listings l JOIN users u ON u.id = l.seller_id WHERE l.id = ?`,
-      args: [req.params.id],
-    });
-    if (r.rows.length === 0) return res.status(404).json({ error: "Not found" });
-    const listingRow = serializeRows(r.rows)[0];
-    listingRow.whatsapp_phone = listingRow.effective_whatsapp_phone;
-    listingRow.call_phone = listingRow.effective_call_phone;
-    delete listingRow.effective_whatsapp_phone;
-    delete listingRow.effective_call_phone;
-    const listing = enrichListing(listingRow);
-    const photos = await db.execute({
-      sql: `SELECT id, photo_data, sort_order FROM listing_photos WHERE listing_id = ? ORDER BY sort_order ASC`,
-      args: [req.params.id],
-    });
-    listing.photos = serializeRows(photos.rows);
-    res.json({ listing });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+    const [listRes, photosRes] = await Promise.all([
+      db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] }),
+      db.execute({
+        sql: "SELECT id, photo_data, sort_order FROM listing_photos WHERE listing_id = ? ORDER BY sort_order ASC",
+        args: [req.params.id],
+      }),
+    ]);
 
-app.get("/api/dealers", async (req, res) => {
-  try {
-    const r = await db.execute(`
-      SELECT u.id, u.name, u.shop_slug, u.town, u.whatsapp_phone, u.call_phone, COUNT(l.id) AS active_listings
-      FROM users u
-      LEFT JOIN listings l ON l.seller_id = u.id AND l.status = 'active' AND (l.expires_at IS NULL OR l.expires_at > CURRENT_TIMESTAMP)
-      WHERE u.is_suspended = 0
-      GROUP BY u.id HAVING active_listings > 0 ORDER BY active_listings DESC
-    `);
-    res.json({ dealers: serializeRows(r.rows) });
+    const listing = rowToObj(listRes);
+    if (!listing) return res.status(404).json({ error: "Listing not found." });
+
+    res.json({
+      listing: {
+        ...listing,
+        photos: rowsToArray(photosRes),
+        days_remaining: computeDaysRemaining(listing),
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1172,67 +869,20 @@ app.get("/api/dealers", async (req, res) => {
 app.post("/api/listings/:id/report", async (req, res) => {
   try {
     const { reason } = req.body;
-    if (!reason || reason.trim().length < 3) return res.status(400).json({ error: "Provide a report reason." });
-    await db.execute({
-      sql: `UPDATE listings SET report_reason = ?, reported_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      args: [reason.trim(), req.params.id],
-    });
-    res.json({ message: "Your report has been sent to Wariara Cars Central Rift for direct post review. The post will remain visible while it is reviewed." });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+    if (!reason || !String(reason).trim()) {
+      return res.status(400).json({ error: "Report reason is required." });
+    }
 
-// ==========================================
-// SELLER POSTING, PAID PLANS (70-DAY POSTS), PAUSE, EDIT & PRIORITY API
-// ==========================================
-app.post("/api/plans/purchase", async (req, res) => {
-  try {
-    const { seller_id, plan_id, payment_ref, payer_phone } = req.body;
-    const uRes = await db.execute({ sql: `SELECT * FROM users WHERE id = ?`, args: [seller_id] });
-    if (uRes.rows.length === 0) return res.status(404).json({ error: "Seller not found" });
-    const seller = serializeRows(uRes.rows)[0];
-
-    const pRes = await db.execute({ sql: `SELECT * FROM post_plans WHERE id = ? AND active = 1`, args: [plan_id] });
-    if (pRes.rows.length === 0) return res.status(404).json({ error: "Plan not found" });
-    const plan = serializeRows(pRes.rows)[0];
-
-    await db.execute({
-      sql: `UPDATE users SET paid_post_credits = paid_post_credits + ? WHERE id = ?`,
-      args: [plan.post_count, seller_id],
-    });
-    await db.execute({
-      sql: `INSERT INTO post_purchases (id, user_id, plan_name, posts_added, amount_kes, payment_ref) VALUES (?, ?, ?, ?, ?, ?)`,
-      args: [
-        crypto.randomUUID(),
-        seller_id,
-        plan.name,
-        plan.post_count,
-        plan.price_kes,
-        payment_ref || "PAYHERO",
-      ],
+    const info = await db.execute({
+      sql: "UPDATE listings SET status = 'reported_suspended', report_reason = ?, updated_at = ? WHERE id = ?",
+      args: [String(reason).trim(), new Date().toISOString(), req.params.id],
     });
 
-    await addSellerNotification(
-      seller_id,
-      `Payment confirmed (KES ${plan.price_kes}): Added ${plan.post_count} post credits (${plan.name} plan). Posts created with paid credits run for ${PAID_POST_LIFETIME_DAYS} days.`
-    );
+    if (Number(info.rowsAffected || 0) === 0) {
+      return res.status(404).json({ error: "Listing not found." });
+    }
 
-    await addAdminPaymentNotification({
-      payerId: seller.id,
-      payerName: seller.name,
-      payerEmail: seller.email,
-      payerPhone: payer_phone || seller.whatsapp_phone || seller.call_phone,
-      amountKes: plan.price_kes,
-      purpose: `Post Plan Purchase: ${plan.name} (${plan.post_count} posts, 70-day duration)`,
-      reference: payment_ref || "PAYHERO",
-    });
-
-    const updatedUser = await db.execute({ sql: `SELECT * FROM users WHERE id = ?`, args: [seller_id] });
-    res.json({
-      message: `Payment confirmed! Added ${plan.post_count} post credits (${plan.name}).`,
-      user: sanitizeUser(serializeRows(updatedUser.rows)[0]),
-    });
+    res.json({ message: "Post reported and temporarily suspended for Admin review." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1240,135 +890,114 @@ app.post("/api/plans/purchase", async (req, res) => {
 
 app.post("/api/listings", async (req, res) => {
   try {
-    const b = req.body;
-    if (!b.seller_id) return res.status(400).json({ error: "Seller account is required to post." });
+    const payload = req.body || {};
+    const fieldError = validateAllPostFieldsRequired(payload);
+    if (fieldError) return res.status(400).json({ error: fieldError });
 
-    const uRes = await db.execute({ sql: `SELECT * FROM users WHERE id = ?`, args: [b.seller_id] });
-    if (uRes.rows.length === 0) return res.status(404).json({ error: "Seller account not found." });
-    const seller = serializeRows(uRes.rows)[0];
-
-    if (seller.is_suspended) {
-      return res.status(403).json({ error: "Account suspended. Submit a review request first." });
+    if (!payload.seller_id) {
+      return res.status(400).json({ error: "Seller account is required." });
     }
 
-    const freeLeft = Math.max(0, 6 - seller.free_posts_used);
-    if (freeLeft === 0 && seller.paid_post_credits <= 0) {
+    const userRes = await db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [payload.seller_id] });
+    const user = rowToObj(userRes);
+
+    if (!user) return res.status(404).json({ error: "Seller account not found." });
+    if (Number(user.is_suspended)) {
+      return res.status(403).json({ error: "Your seller account is suspended." });
+    }
+
+    const freeUsed = Number(user.free_posts_used || 0);
+    const paidCredits = Number(user.paid_post_credits || 0);
+
+    let usedPaidCredit = false;
+    if (freeUsed < 6) {
+      await db.execute({
+        sql: "UPDATE users SET free_posts_used = ? WHERE id = ?",
+        args: [freeUsed + 1, user.id],
+      });
+    } else if (paidCredits > 0) {
+      usedPaidCredit = true;
+      await db.execute({
+        sql: "UPDATE users SET paid_post_credits = ? WHERE id = ?",
+        args: [paidCredits - 1, user.id],
+      });
+    } else {
       return res.status(402).json({
-        error: "You have used all 6 free posts. Purchase a post package to post more.",
+        error: "You have used all 6 free posts. Purchase a post plan to continue posting.",
         needs_plan: true,
       });
     }
 
-    const category = b.category === "part" ? "part" : "motor";
-    const priceNum = optionalNumber(b.price_kes) ?? 0;
-    const town = String(b.town || seller.town || "").trim();
-    const description = String(b.description || "").trim();
-
-    const hasListingInformation = Boolean(description || b.year || b.brand || b.model || b.part_name || b.part_make || b.part_model || b.price_kes);
-    if (!hasListingInformation) return res.status(400).json({ error: "Enter at least one listing detail or a description." });
-    if (priceNum < 0) return res.status(400).json({ error: "Price cannot be negative." });
-
-    const photos = Array.isArray(b.photos) ? b.photos : [];
-    if (photos.length < 1) return res.status(400).json({ error: "Add at least 1 photo." });
-    if (photos.length > 5) return res.status(400).json({ error: "A listing may contain at most 5 photos." });
-    if (photos.some((photo) => typeof photo !== "string")) {
-      return res.status(400).json({ error: "Listing photos must be image data." });
-    }
-
-    const useFreePost = freeLeft > 0;
-    const expiresAt = useFreePost
-      ? null
-      : new Date(Date.now() + PAID_POST_LIFETIME_DAYS * 24 * 3600 * 1000).toISOString();
-
     const id = crypto.randomUUID();
-    const title =
-      category === "motor"
-        ? [optionalText(b.year), optionalText(b.brand), optionalText(b.model)].filter(Boolean).join(" ") || "Motor listing"
-        : [optionalText(b.part_name), optionalText(b.part_make), optionalText(b.part_model)].filter(Boolean).join(" ") ||
-          "Spare parts listing";
+    const title = buildListingTitle(payload);
+    const nowIso = new Date().toISOString();
 
     await db.execute({
-      sql: `INSERT INTO listings (
-        id, seller_id, category, title, price_kes, negotiable, town, description,
-        vehicle_type, reg_number, condition_type, brand, model, body_type, year,
-        fuel_type, transmission, drive_type, air_con, engine_cc, mileage_km,
-        part_name, part_make, part_model, year_from, year_to, part_condition, part_authenticity,
-        whatsapp_phone, call_phone, is_paid_post, expires_at, status
-      ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-        'pending_approval'
-      )`,
+      sql: `INSERT INTO listings
+        (id, seller_id, seller_name, seller_slug, whatsapp_phone, call_phone, category, title,
+         vehicle_type, condition_type, brand, model, body_type, year, reg_number, fuel_type,
+         transmission, drive_type, air_con, engine_cc, mileage_km,
+         part_name, part_make, part_model, year_from, year_to, part_condition, part_authenticity,
+         price_kes, negotiable, town, description, status, is_paid_post, published_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, NULL, ?, ?)`,
       args: [
         id,
-        seller.id,
-        category,
+        user.id,
+        user.name,
+        user.shop_slug || slugify(user.name),
+        user.whatsapp_phone,
+        user.call_phone,
+        payload.category,
         title,
-        priceNum,
-        b.negotiable === "No" ? "No" : "Yes",
-        town,
-        description,
-        category === "motor" ? optionalText(b.vehicle_type) : null,
-        category === "motor" ? optionalText(b.reg_number) : null,
-        category === "motor" ? optionalText(b.condition_type) : null,
-        category === "motor" ? optionalText(b.brand) : null,
-        category === "motor" ? optionalText(b.model) : null,
-        category === "motor" ? optionalText(b.body_type) : null,
-        category === "motor" ? optionalNumber(b.year) : null,
-        category === "motor" ? optionalText(b.fuel_type) : null,
-        category === "motor" ? optionalText(b.transmission) : null,
-        category === "motor" ? optionalText(b.drive_type) : null,
-        category === "motor" ? optionalText(b.air_con) : null,
-        category === "motor" ? optionalNumber(b.engine_cc) : null,
-        category === "motor" ? optionalNumber(b.mileage_km) : null,
-        category === "part" ? optionalText(b.part_name) : null,
-        category === "part" ? optionalText(b.part_make) : null,
-        category === "part" ? optionalText(b.part_model) : null,
-        category === "part" ? optionalNumber(b.year_from) : null,
-        category === "part" ? optionalNumber(b.year_to) : null,
-        category === "part" ? optionalText(b.part_condition) : null,
-        category === "part" ? optionalText(b.part_authenticity) : null,
-        normalizeKenyanPhone(seller.whatsapp_phone),
-        seller.call_phone || seller.phone || null,
-        useFreePost ? 0 : 1,
-        expiresAt,
+        payload.category === "motor" ? payload.vehicle_type : null,
+        payload.category === "motor" ? payload.condition_type : null,
+        payload.category === "motor" ? payload.brand : null,
+        payload.category === "motor" ? payload.model : null,
+        payload.category === "motor" ? payload.body_type : null,
+        payload.category === "motor" ? Number(payload.year) : null,
+        payload.category === "motor" ? String(payload.reg_number).trim() : null,
+        payload.category === "motor" ? payload.fuel_type : null,
+        payload.category === "motor" ? payload.transmission : null,
+        payload.category === "motor" ? payload.drive_type : null,
+        payload.category === "motor" ? payload.air_con : null,
+        payload.category === "motor" ? Number(payload.engine_cc) : null,
+        payload.category === "motor" ? Number(payload.mileage_km) : null,
+        payload.category === "part" ? String(payload.part_name).trim() : null,
+        payload.category === "part" ? String(payload.part_make).trim() : null,
+        payload.category === "part" ? String(payload.part_model).trim() : null,
+        payload.category === "part" ? Number(payload.year_from) : null,
+        payload.category === "part" ? Number(payload.year_to) : null,
+        payload.category === "part" ? payload.part_condition : null,
+        payload.category === "part" ? payload.part_authenticity : null,
+        Number(payload.price_kes),
+        payload.negotiable,
+        String(payload.town).trim(),
+        String(payload.description).trim(),
+        usedPaidCredit ? 1 : 0,
+        nowIso,
+        nowIso,
       ],
     });
 
-    for (let i = 0; i < photos.length; i++) {
+    for (let idx = 0; idx < payload.photos.slice(0, 6).length; idx++) {
       await db.execute({
-        sql: `INSERT INTO listing_photos (id, listing_id, photo_data, sort_order) VALUES (?, ?, ?, ?)`,
-        args: [crypto.randomUUID(), id, photos[i], i],
+        sql: "INSERT INTO listing_photos (id, listing_id, photo_data, sort_order) VALUES (?, ?, ?, ?)",
+        args: [crypto.randomUUID(), id, payload.photos[idx], idx],
       });
     }
 
-    if (useFreePost) {
-      const nextFreeUsed = Number(seller.free_posts_used) + 1;
-      await db.execute({
-        sql: `UPDATE users SET free_posts_used = ? WHERE id = ?`,
-        args: [nextFreeUsed, seller.id],
-      });
-      await addSellerNotification(
-        seller.id,
-        `Post submitted ("${title}"): 1 Free post deducted (${nextFreeUsed}/6 used; ${Math.max(0, 6 - nextFreeUsed)} free left). Awaiting Admin approval.`
-      );
-    } else {
-      const nextPaidCredits = Math.max(0, Number(seller.paid_post_credits) - 1);
-      await db.execute({
-        sql: `UPDATE users SET paid_post_credits = ? WHERE id = ?`,
-        args: [nextPaidCredits, seller.id],
-      });
-      await addSellerNotification(
-        seller.id,
-        `Post submitted ("${title}"): 1 Paid post credit deducted (${nextPaidCredits} paid credits left). Runs for ${PAID_POST_LIFETIME_DAYS} days after approval.`
-      );
-    }
+    await addSellerNotification(
+      user.id,
+      usedPaidCredit
+        ? `Deducted 1 paid post credit for "${title}" (pending Admin approval; runs for 70 days once published).`
+        : `Used 1 free post slot (${freeUsed + 1}/6) for "${title}" (pending Admin approval).`
+    );
 
-    res.status(201).json({
-      id,
-      message: useFreePost
-        ? "Post submitted! 1 free post credit deducted. Awaiting Admin approval."
-        : `Post submitted! 1 paid post credit deducted (70-day duration). Awaiting Admin approval.`,
+    const createdRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [id] });
+
+    res.json({
+      message: "Post submitted and sent to Admin for approval.",
+      listing: rowToObj(createdRes),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1377,106 +1006,63 @@ app.post("/api/listings", async (req, res) => {
 
 app.put("/api/listings/:id", async (req, res) => {
   try {
-    const r = await db.execute({ sql: `SELECT * FROM listings WHERE id = ?`, args: [req.params.id] });
-    if (r.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
-    const existing = serializeRows(r.rows)[0];
-    const b = req.body;
+    const payload = req.body || {};
+    const fieldError = validateAllPostFieldsRequired(payload);
+    if (fieldError) return res.status(400).json({ error: fieldError });
 
-    if (!b.seller_id || b.seller_id !== existing.seller_id) {
-      return res.status(403).json({ error: "Only the post owner can edit this listing." });
-    }
-
-    const text = (key) => Object.hasOwn(b, key) ? optionalText(b[key]) : existing[key];
-    const number = (key) => Object.hasOwn(b, key) ? optionalNumber(b[key]) : existing[key];
-    const description = String(b.description ?? existing.description ?? "").trim();
-    if (!description) return res.status(400).json({ error: "A description is required." });
-    const price = Object.hasOwn(b, "price_kes") ? optionalNumber(b.price_kes) ?? 0 : Number(existing.price_kes);
-    if (price < 0) return res.status(400).json({ error: "Price cannot be negative." });
-    const next = {
-      vehicle_type: text("vehicle_type"),
-      reg_number: text("reg_number"),
-      condition_type: text("condition_type"),
-      brand: text("brand"),
-      model: text("model"),
-      body_type: text("body_type"),
-      year: number("year"),
-      fuel_type: text("fuel_type"),
-      transmission: text("transmission"),
-      drive_type: text("drive_type"),
-      air_con: text("air_con"),
-      engine_cc: number("engine_cc"),
-      mileage_km: number("mileage_km"),
-      part_name: text("part_name"),
-      part_make: text("part_make"),
-      part_model: text("part_model"),
-      year_from: number("year_from"),
-      year_to: number("year_to"),
-      part_condition: text("part_condition"),
-      part_authenticity: text("part_authenticity"),
-      whatsapp_phone: Object.hasOwn(b, "whatsapp_phone")
-        ? (optionalText(b.whatsapp_phone) ? normalizeKenyanPhone(b.whatsapp_phone) : null)
-        : existing.whatsapp_phone,
-      call_phone: text("call_phone"),
-    };
-    const title = existing.category === "motor"
-      ? [next.year, next.brand, next.model].filter(Boolean).join(" ") || "Motor listing"
-      : [next.part_name, next.part_make, next.part_model].filter(Boolean).join(" ") || "Spare parts listing";
+    const existingRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] });
+    const existing = rowToObj(existingRes);
+    if (!existing) return res.status(404).json({ error: "Listing not found." });
 
     await db.execute({
       sql: `UPDATE listings SET
-        title = ?, price_kes = ?, negotiable = ?, town = ?, description = ?,
-        vehicle_type = ?, reg_number = ?, condition_type = ?, brand = ?, model = ?, body_type = ?,
-        year = ?, fuel_type = ?, transmission = ?, drive_type = ?, air_con = ?, engine_cc = ?, mileage_km = ?,
-        part_name = ?, part_make = ?, part_model = ?, year_from = ?, year_to = ?, part_condition = ?, part_authenticity = ?,
-        whatsapp_phone = ?, call_phone = ?
+        title = ?, vehicle_type = ?, condition_type = ?, brand = ?, model = ?, body_type = ?,
+        year = ?, reg_number = ?, fuel_type = ?, transmission = ?, drive_type = ?, air_con = ?,
+        engine_cc = ?, mileage_km = ?, part_name = ?, part_make = ?, part_model = ?,
+        year_from = ?, year_to = ?, part_condition = ?, part_authenticity = ?,
+        price_kes = ?, negotiable = ?, town = ?, description = ?, updated_at = ?
         WHERE id = ?`,
       args: [
-        title,
-        price,
-        b.negotiable === "No" ? "No" : "Yes",
-        String(b.town ?? existing.town ?? "").trim(),
-        description,
-        next.vehicle_type,
-        next.reg_number,
-        next.condition_type,
-        next.brand,
-        next.model,
-        next.body_type,
-        next.year,
-        next.fuel_type,
-        next.transmission,
-        next.drive_type,
-        next.air_con,
-        next.engine_cc,
-        next.mileage_km,
-        next.part_name,
-        next.part_make,
-        next.part_model,
-        next.year_from,
-        next.year_to,
-        next.part_condition,
-        next.part_authenticity,
-        next.whatsapp_phone,
-        next.call_phone,
-        req.params.id,
+        buildListingTitle(payload),
+        existing.category === "motor" ? payload.vehicle_type : null,
+        existing.category === "motor" ? payload.condition_type : null,
+        existing.category === "motor" ? payload.brand : null,
+        existing.category === "motor" ? payload.model : null,
+        existing.category === "motor" ? payload.body_type : null,
+        existing.category === "motor" ? Number(payload.year) : null,
+        existing.category === "motor" ? String(payload.reg_number).trim() : null,
+        existing.category === "motor" ? payload.fuel_type : null,
+        existing.category === "motor" ? payload.transmission : null,
+        existing.category === "motor" ? payload.drive_type : null,
+        existing.category === "motor" ? payload.air_con : null,
+        existing.category === "motor" ? Number(payload.engine_cc) : null,
+        existing.category === "motor" ? Number(payload.mileage_km) : null,
+        existing.category === "part" ? String(payload.part_name).trim() : null,
+        existing.category === "part" ? String(payload.part_make).trim() : null,
+        existing.category === "part" ? String(payload.part_model).trim() : null,
+        existing.category === "part" ? Number(payload.year_from) : null,
+        existing.category === "part" ? Number(payload.year_to) : null,
+        existing.category === "part" ? payload.part_condition : null,
+        existing.category === "part" ? payload.part_authenticity : null,
+        Number(payload.price_kes),
+        payload.negotiable,
+        String(payload.town).trim(),
+        String(payload.description).trim(),
+        new Date().toISOString(),
+        existing.id,
       ],
     });
 
-    if (Array.isArray(b.photos)) {
-      if (b.photos.some((photo) => typeof photo !== "string")) {
-        return res.status(400).json({ error: "Listing photos must be image data." });
-      }
-      if (b.photos.length > 5) return res.status(400).json({ error: "A listing may contain at most 5 photos." });
-      await db.execute({ sql: `DELETE FROM listing_photos WHERE listing_id = ?`, args: [req.params.id] });
-      for (let i = 0; i < b.photos.length; i++) {
-        await db.execute({
-          sql: `INSERT INTO listing_photos (id, listing_id, photo_data, sort_order) VALUES (?, ?, ?, ?)`,
-          args: [crypto.randomUUID(), req.params.id, b.photos[i], i],
-        });
-      }
+    await db.execute({ sql: "DELETE FROM listing_photos WHERE listing_id = ?", args: [existing.id] });
+    for (let idx = 0; idx < payload.photos.slice(0, 6).length; idx++) {
+      await db.execute({
+        sql: "INSERT INTO listing_photos (id, listing_id, photo_data, sort_order) VALUES (?, ?, ?, ?)",
+        args: [crypto.randomUUID(), existing.id, payload.photos[idx], idx],
+      });
     }
 
-    res.json({ message: "Listing updated." });
+    const updatedRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [existing.id] });
+    res.json({ message: "Post updated.", listing: rowToObj(updatedRes) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1484,51 +1070,51 @@ app.put("/api/listings/:id", async (req, res) => {
 
 app.patch("/api/listings/:id/status", async (req, res) => {
   try {
-    const { status, seller_id } = req.body;
-    if (!["active", "paused", "sold"].includes(status)) return res.status(400).json({ error: "Invalid status" });
-
-    const r = await db.execute({ sql: `SELECT * FROM listings WHERE id = ?`, args: [req.params.id] });
-    if (r.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
-    const existing = enrichListing(serializeRows(r.rows)[0]);
-
-    if (!seller_id || seller_id !== existing.seller_id) return res.status(403).json({ error: "Unauthorized" });
-    if (existing.status === "expired") {
-      return res.status(403).json({ error: "This post has expired after 70 days." });
+    const { status } = req.body;
+    if (!["active", "paused"].includes(status)) {
+      return res.status(400).json({ error: "Status must be active or paused." });
     }
-    if (["pending_approval", "reported_suspended", "unsafe_removed"].includes(existing.status)) {
-      return res.status(403).json({ error: "Listing is currently under Admin approval or safety review." });
-    }
-
     await db.execute({
-      sql: `UPDATE listings
-            SET status = ?,
-                priority_amount_kes = CASE WHEN ? = 'sold' THEN 0 ELSE priority_amount_kes END,
-                priority_expires_at = CASE WHEN ? = 'sold' THEN NULL ELSE priority_expires_at END,
-                priority_plan_name = CASE WHEN ? = 'sold' THEN NULL ELSE priority_plan_name END
-            WHERE id = ?`,
-      args: [status, status, status, status, req.params.id],
+      sql: "UPDATE listings SET status = ?, updated_at = ? WHERE id = ?",
+      args: [status, new Date().toISOString(), req.params.id],
     });
-    res.json({ message: `Post marked as ${status}.` });
+    const updatedRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] });
+    const updated = rowToObj(updatedRes);
+    if (!updated) return res.status(404).json({ error: "Listing not found." });
+    res.json({ listing: updated });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.delete("/api/listings/:id", async (req, res) => {
+app.get("/api/priority/leaderboard", async (req, res) => {
   try {
-    const sellerId = req.body?.seller_id || req.query.seller_id;
-    const listing = await db.execute({
-      sql: `SELECT seller_id FROM listings WHERE id = ?`,
-      args: [req.params.id],
-    });
-    if (listing.rows.length === 0) return res.status(404).json({ error: "Listing not found." });
-    if (!sellerId || sellerId !== listing.rows[0].seller_id) {
-      return res.status(403).json({ error: "Only the post owner can delete this listing." });
-    }
+    const [settingsRes, listRes] = await Promise.all([
+      db.execute("SELECT * FROM platform_settings"),
+      db.execute("SELECT * FROM listings WHERE status = 'active'"),
+    ]);
 
-    await db.execute({ sql: `DELETE FROM listing_photos WHERE listing_id = ?`, args: [req.params.id] });
-    await db.execute({ sql: `DELETE FROM listings WHERE id = ?`, args: [req.params.id] });
-    res.json({ message: "Listing deleted." });
+    const settings = {};
+    for (const r of rowsToArray(settingsRes)) settings[r.key] = r.value;
+    const baseFee = Number(settings.base_priority_price_kes || 300);
+
+    const todayStr = todayKenyaDate();
+    const activeToday = rowsToArray(listRes)
+      .filter((l) => String(l.priority_date || "").slice(0, 10) === todayStr && Number(l.priority_amount_kes || 0) > 0)
+      .sort((a, b) => Number(b.priority_amount_kes) - Number(a.priority_amount_kes));
+
+    const maxSlots = 20;
+    const usedSlots = Math.min(maxSlots, activeToday.length);
+    const topBid = activeToday[0] ? Number(activeToday[0].priority_amount_kes) : 0;
+    const recommendedForTop1 = topBid >= baseFee ? topBid + 50 : baseFee;
+
+    res.json({
+      baseFee,
+      maxSlots,
+      usedSlots,
+      recommendedForTop1,
+      leaderboard: activeToday.slice(0, maxSlots),
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1536,448 +1122,294 @@ app.delete("/api/listings/:id", async (req, res) => {
 
 app.post("/api/listings/:id/prioritize", async (req, res) => {
   try {
-    const { seller_id, priority_plan_id } = req.body;
-    const paymentRef = req.body.payment_ref || "PAYHERO";
-    const payerPhone = req.body.payer_phone || "";
-
-    const lRes = await db.execute({
-      sql: `SELECT l.*, u.name AS seller_name, u.email AS seller_email,
-                   u.whatsapp_phone AS account_whatsapp_phone, u.call_phone AS account_call_phone
-            FROM listings l JOIN users u ON u.id = l.seller_id WHERE l.id = ?`,
-      args: [req.params.id],
-    });
-    if (lRes.rows.length === 0) return res.status(404).json({ error: "Listing not found." });
-    const targetListing = enrichListing(serializeRows(lRes.rows)[0]);
-    if (!seller_id || seller_id !== targetListing.seller_id) {
-      return res.status(403).json({ error: "Only the post owner can prioritize this listing." });
-    }
-    if (targetListing.status !== "active") {
-      return res.status(400).json({ error: "Only active approved posts can be prioritized." });
+    const { amount_kes, payment_ref = "", payer_phone = "" } = req.body;
+    const amount = Number(amount_kes);
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: "Valid priority amount in KES is required." });
     }
 
-    const planResult = await db.execute({
-      sql: `SELECT * FROM priority_plans WHERE id = ? AND active = 1`,
-      args: [priority_plan_id],
-    });
-    if (planResult.rows.length === 0) return res.status(404).json({ error: "Priority plan not found." });
-    const plan = serializeRows(planResult.rows)[0];
-    const priorityExpiresAt = new Date(Date.now() + Number(plan.duration_hours) * 60 * 60 * 1000).toISOString();
+    const [settingsRes, listRes, allActiveRes] = await Promise.all([
+      db.execute("SELECT * FROM platform_settings"),
+      db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] }),
+      db.execute("SELECT id, priority_date, priority_amount_kes FROM listings WHERE status = 'active'"),
+    ]);
+
+    const listing = rowToObj(listRes);
+    if (!listing) return res.status(404).json({ error: "Listing not found." });
+
+    const settings = {};
+    for (const r of rowsToArray(settingsRes)) settings[r.key] = r.value;
+    const baseFee = Number(settings.base_priority_price_kes || 300);
+
+    if (amount < baseFee) {
+      return res.status(400).json({ error: `Minimum priority fee is KES ${baseFee}.` });
+    }
+
+    const todayStr = todayKenyaDate();
+    const todaySponsored = rowsToArray(allActiveRes).filter(
+      (x) => String(x.priority_date || "").slice(0, 10) === todayStr && Number(x.priority_amount_kes || 0) > 0
+    );
+
+    const alreadySponsoredToday = todaySponsored.some((x) => x.id === listing.id);
+    if (!alreadySponsoredToday && todaySponsored.length >= 20) {
+      return res.status(409).json({ error: "All 20 daily sponsored priority slots are full for today." });
+    }
 
     await db.execute({
-      sql: `UPDATE listings SET priority_amount_kes = ?, priority_expires_at = ?, priority_plan_name = ? WHERE id = ?`,
-      args: [plan.price_kes, priorityExpiresAt, plan.name, req.params.id],
+      sql: "UPDATE listings SET priority_amount_kes = ?, priority_date = ?, updated_at = ? WHERE id = ?",
+      args: [amount, todayStr, new Date().toISOString(), listing.id],
     });
 
     await addSellerNotification(
-      targetListing.seller_id,
-      `Payment confirmed (KES ${plan.price_kes}): Post "${targetListing.title}" prioritized for ${plan.duration_hours} hours (${plan.name}).`
+      listing.seller_id,
+      `Prioritized "${listing.title}" for today with KES ${amount}. Higher amounts appear higher in the Top 20.`
     );
 
-    await addAdminPaymentNotification({
-      payerId: targetListing.seller_id,
-      payerName: targetListing.seller_name,
-      payerEmail: targetListing.seller_email,
-      payerPhone: payerPhone || targetListing.whatsapp_phone || targetListing.account_whatsapp_phone ||
-        targetListing.call_phone || targetListing.account_call_phone,
-      amountKes: plan.price_kes,
-      purpose: `Prioritise Post (${plan.name}, ${plan.duration_hours}h): ${targetListing.title}`,
-      reference: paymentRef,
+    await addPaymentNotification({
+      sellerId: listing.seller_id,
+      payerName: listing.seller_name,
+      payerPhone: payer_phone || listing.whatsapp_phone,
+      purpose: `24h Post Priority: ${listing.title}`,
+      amountKes: amount,
+      paymentRef,
     });
 
+    const updatedRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [listing.id] });
+
     res.json({
-      message: `Payment confirmed! "${targetListing.title}" is prioritized for ${plan.duration_hours} hours (${plan.name}).`,
-      priority_expires_at: priorityExpiresAt,
+      message: `"${listing.title}" is now prioritized for today with KES ${amount}.`,
+      listing: rowToObj(updatedRes),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ==========================================
-// DEDICATED ADMIN PORTAL API
-// ==========================================
-app.get("/api/admin/overview", requireAdminKey, async (req, res) => {
-  try {
-    const listingsRes = await db.execute(`
-      SELECT l.*, u.name AS seller_name, u.email AS seller_email,
-             u.whatsapp_phone AS account_whatsapp_phone, u.call_phone AS account_call_phone,
-             (SELECT photo_data FROM listing_photos p WHERE p.listing_id = l.id ORDER BY p.sort_order ASC LIMIT 1) AS cover_photo
-      FROM listings l JOIN users u ON u.id = l.seller_id
-      ORDER BY CASE l.status WHEN 'reported_suspended' THEN 1 WHEN 'pending_approval' THEN 2 WHEN 'active' THEN 3 WHEN 'expired' THEN 4 ELSE 5 END, l.created_at DESC
-    `);
-    const users = await db.execute(`
-      SELECT u.*,
-             (SELECT COUNT(*) FROM listings l WHERE l.seller_id = u.id) AS total_posts,
-             (SELECT COALESCE(SUM(posts_added), 0) FROM post_purchases pp WHERE pp.user_id = u.id) AS total_purchased_posts,
-             (SELECT COALESCE(SUM(amount_kes), 0) FROM post_purchases pp WHERE pp.user_id = u.id) AS total_spent_kes
-      FROM users u ORDER BY u.created_at DESC
-    `);
-    const paymentNotifications = await db.execute(`
-      SELECT * FROM admin_payment_notifications ORDER BY created_at DESC LIMIT 100
-    `);
-    const plans = await db.execute(`SELECT * FROM post_plans ORDER BY price_kes ASC`);
-    const priorityPlans = await db.execute(`SELECT * FROM priority_plans ORDER BY duration_hours ASC, price_kes ASC`);
-    const catalog = await db.execute(`SELECT * FROM vehicle_catalog ORDER BY brand ASC, model ASC`);
-    const subAccountRows = await db.execute(`SELECT email, two_factor_enabled, updated_at FROM admin_sub_accounts WHERE id = 'primary'`);
-    const subAccount = subAccountRows.rows.length
-      ? serializeRows(subAccountRows.rows)[0]
-      : { email: "", two_factor_enabled: 0, updated_at: null };
-    subAccount.configured = subAccountRows.rows.length > 0;
+// ================= ADMIN ROUTES =================
 
-    const sRows = await db.execute(`SELECT * FROM settings`);
+app.get("/api/admin/overview", requireAdmin, async (req, res) => {
+  try {
+    await syncExpiredListings();
+
+    const [listingsRes, usersRes, plansRes, settingsRes, payNotifsRes] = await Promise.all([
+      db.execute("SELECT * FROM listings ORDER BY created_at DESC"),
+      db.execute("SELECT * FROM users ORDER BY created_at DESC"),
+      db.execute("SELECT * FROM post_plans ORDER BY price_kes ASC"),
+      db.execute("SELECT * FROM platform_settings"),
+      db.execute("SELECT * FROM payment_notifications ORDER BY created_at DESC LIMIT 100"),
+    ]);
+
+    const listings = rowsToArray(listingsRes);
+    const listingIds = listings.map((l) => l.id);
+    const coverMap = {};
+
+    if (listingIds.length > 0) {
+      const placeholders = listingIds.map(() => "?").join(",");
+      const photosRes = await db.execute({
+        sql: `SELECT listing_id, photo_data, sort_order FROM listing_photos WHERE listing_id IN (${placeholders}) ORDER BY sort_order ASC`,
+        args: listingIds,
+      });
+      for (const p of rowsToArray(photosRes)) {
+        if (!coverMap[p.listing_id]) coverMap[p.listing_id] = p.photo_data;
+      }
+    }
+
+    const enrichedListings = listings.map((l) => ({
+      ...l,
+      cover_photo: coverMap[l.id] || "",
+      days_remaining: computeDaysRemaining(l),
+    }));
+
+    const safeUsers = rowsToArray(usersRes).map(sanitizeUser);
+
     const settings = {};
-    for (const r of sRows.rows) settings[r.key] = r.value;
-
-    const listings = serializeRows(listingsRes.rows).map((listing) => {
-      listing.whatsapp_phone = listing.whatsapp_phone || listing.account_whatsapp_phone;
-      listing.call_phone = listing.call_phone || listing.account_call_phone;
-      delete listing.account_whatsapp_phone;
-      delete listing.account_call_phone;
-      return enrichListing(listing);
-    });
+    for (const r of rowsToArray(settingsRes)) settings[r.key] = r.value;
 
     res.json({
-      listings,
-      users: serializeRows(users.rows).map(sanitizeUser),
-      paymentNotifications: serializeRows(paymentNotifications.rows),
-      plans: serializeRows(plans.rows),
-      priorityPlans: serializeRows(priorityPlans.rows),
-      catalog: serializeRows(catalog.rows),
-      subAccount,
+      listings: enrichedListings,
+      users: safeUsers,
+      plans: rowsToArray(plansRes),
       settings,
+      paymentNotifications: rowsToArray(payNotifsRes),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/api/admin/listings/:id/moderate", requireAdminKey, async (req, res) => {
+app.post("/api/admin/dealers", requireAdmin, async (req, res) => {
   try {
-    const { action } = req.body;
-    const r = await db.execute({ sql: `SELECT * FROM listings WHERE id = ?`, args: [req.params.id] });
-    if (r.rows.length === 0) return res.status(404).json({ error: "Listing not found." });
-    const existing = serializeRows(r.rows)[0];
+    const { user_id, name, email, whatsapp_phone, call_phone, town = "Nakuru" } = req.body;
 
-    let status;
-    let nextExpiresAt = existing.expires_at;
-    if (action === "approve" || action === "mark_safe" || action === "unpause") {
-      status = "active";
-      if (Number(existing.is_paid_post) === 1 && !existing.expires_at) {
-        nextExpiresAt = new Date(Date.now() + PAID_POST_LIFETIME_DAYS * 24 * 3600 * 1000).toISOString();
-      }
-    } else if (action === "pause") {
-      status = "paused";
-    } else if (action === "mark_unsafe" || action === "reject") {
-      status = "unsafe_removed";
-    } else {
-      return res.status(400).json({ error: "Invalid action" });
+    if (user_id) {
+      const userRes = await db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [user_id] });
+      const existing = rowToObj(userRes);
+      if (!existing) return res.status(404).json({ error: "Seller account not found." });
+      await db.execute({ sql: "UPDATE users SET role = 'dealer' WHERE id = ?", args: [user_id] });
+      return res.json({ message: `${existing.name} is now marked as a Dealer.` });
     }
 
-    await db.execute({
-      sql: `UPDATE listings SET status = ?, expires_at = ?, report_reason = CASE WHEN ? = 'active' THEN NULL ELSE report_reason END WHERE id = ?`,
-      args: [status, nextExpiresAt, status, req.params.id],
-    });
-    res.json({ message: `Post status changed to ${status}.` });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.put("/api/admin/listings/:id", requireAdminKey, async (req, res) => {
-  try {
-    const listing = await db.execute({
-      sql: `SELECT id FROM listings WHERE id = ?`,
-      args: [req.params.id],
-    });
-    if (listing.rows.length === 0) return res.status(404).json({ error: "Listing not found." });
-
-    const { title, price_kes, town, description } = req.body;
-    if (!String(title || "").trim() || !String(description || "").trim()) {
-      return res.status(400).json({ error: "Title and description are required." });
-    }
-    const price = optionalNumber(price_kes) ?? 0;
-    if (price < 0) return res.status(400).json({ error: "Price cannot be negative." });
-
-    await db.execute({
-      sql: `UPDATE listings SET title = ?, price_kes = ?, town = ?, description = ? WHERE id = ?`,
-      args: [
-        String(title).trim(),
-        price,
-        String(town || "").trim(),
-        String(description).trim(),
-        req.params.id,
-      ],
-    });
-    res.json({ message: "Listing updated." });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.put("/api/admin/users/:id/profile", requireAdminKey, async (req, res) => {
-  try {
-    const userResult = await db.execute({
-      sql: `SELECT * FROM users WHERE id = ?`,
-      args: [req.params.id],
-    });
-    if (userResult.rows.length === 0) return res.status(404).json({ error: "Account not found." });
-    const existing = serializeRows(userResult.rows)[0];
-
-    const { name, role, town, whatsapp_phone, call_phone, agent_of } = req.body;
-    if (!String(name ?? existing.name).trim() || !["private", "dealer"].includes(role)) {
-      return res.status(400).json({ error: "Enter a name and a valid account type." });
-    }
-    let agentId = agent_of || null;
-    if (agentId) {
-      const dealer = await db.execute({
-        sql: `SELECT id FROM users WHERE id = ? AND role = 'dealer' AND is_suspended = 0`,
-        args: [agentId],
-      });
-      if (dealer.rows.length === 0 || agentId === req.params.id) {
-        return res.status(400).json({ error: "Select an active dealership for this agent." });
-      }
-    }
-    if (role === "dealer") agentId = null;
-
-    const normalizedWhatsApp = normalizeKenyanPhone(whatsapp_phone ?? existing.whatsapp_phone);
-    const phoneKey = phoneRegistryKey(normalizedWhatsApp);
-    if (phoneKey) {
-      const registeredPhone = await db.execute({
-        sql: `SELECT user_id FROM whatsapp_phone_registry WHERE phone_key = ?`,
-        args: [phoneKey],
-      });
-      if (registeredPhone.rows.some((row) => row.user_id !== req.params.id)) {
-        return res.status(409).json({ error: "This WhatsApp number is already used by another account." });
-      }
-      if (registeredPhone.rows.length === 0) {
-        try {
-          await db.execute({
-            sql: `INSERT INTO whatsapp_phone_registry (phone_key, user_id) VALUES (?, ?)`,
-            args: [phoneKey, req.params.id],
-          });
-        } catch (err) {
-          if (String(err.message).includes("UNIQUE constraint failed")) {
-            return res.status(409).json({ error: "This WhatsApp number is already used by another account." });
-          }
-          throw err;
-        }
-      }
+    if (!name || !email || !whatsapp_phone || !call_phone) {
+      return res.status(400).json({ error: "Name, email, WhatsApp, and call phone are required to add a dealer." });
     }
 
-    try {
+    const cleanEmail = String(email).trim().toLowerCase();
+    const existingRes = await db.execute({ sql: "SELECT * FROM users WHERE email = ?", args: [cleanEmail] });
+    const existing = rowToObj(existingRes);
+
+    if (existing) {
       await db.execute({
-        sql: `UPDATE users SET name = ?, role = ?, town = ?, whatsapp_phone = ?, call_phone = ?, agent_of = ? WHERE id = ?`,
+        sql: "UPDATE users SET name = ?, whatsapp_phone = ?, call_phone = ?, town = ?, role = 'dealer', shop_slug = ? WHERE id = ?",
         args: [
-          String(name ?? existing.name).trim(),
-          role,
-          String(town ?? existing.town ?? "").trim(),
-          normalizedWhatsApp,
-          String(call_phone ?? existing.call_phone ?? "").trim(),
-          agentId,
-          req.params.id,
+          String(name).trim(),
+          String(whatsapp_phone).trim(),
+          String(call_phone).trim(),
+          String(town).trim() || "Nakuru",
+          existing.shop_slug || slugify(name),
+          existing.id,
         ],
       });
-    } catch (err) {
-      if (phoneKey && phoneKey !== phoneRegistryKey(existing.whatsapp_phone)) {
-        await db.execute({
-          sql: `DELETE FROM whatsapp_phone_registry WHERE phone_key = ? AND user_id = ?`,
-          args: [phoneKey, req.params.id],
-        });
-      }
-      throw err;
+      return res.json({ message: `Updated ${String(name).trim()} as a Dealer.` });
     }
+
+    const id = crypto.randomUUID();
+    const tempPass = crypto.randomBytes(12).toString("hex");
+    const nowIso = new Date().toISOString();
+
     await db.execute({
-      sql: `DELETE FROM whatsapp_phone_registry WHERE user_id = ? AND phone_key != ?`,
-      args: [req.params.id, phoneKey],
+      sql: `INSERT INTO users
+        (id, name, email, password_hash, whatsapp_phone, call_phone, role, town, shop_slug,
+         free_posts_used, paid_post_credits, total_purchased_posts, total_spent_kes, is_suspended, terms_accepted_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'dealer', ?, ?, 0, 0, 0, 0, 0, ?, ?)`,
+      args: [
+        id,
+        String(name).trim(),
+        cleanEmail,
+        hashPassword(tempPass),
+        String(whatsapp_phone).trim(),
+        String(call_phone).trim(),
+        String(town).trim() || "Nakuru",
+        slugify(name),
+        nowIso,
+        nowIso,
+      ],
     });
-    res.json({ message: agentId ? "Dealership agent updated." : "Account updated." });
+
+    res.json({ message: `Added dealer "${String(name).trim()}".` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/api/admin/users/:id/gift-posts", requireAdminKey, async (req, res) => {
+app.delete("/api/admin/dealers/:id", requireAdmin, async (req, res) => {
   try {
-    const count = Number(req.body.posts_count);
-    const confirmPhone = String(req.body.confirm_whatsapp || "").trim();
-    if (!count || count < 1) return res.status(400).json({ error: "Enter valid posts count." });
-    if (!confirmPhone) return res.status(400).json({ error: "Enter the seller's registered WhatsApp number." });
-    const target = await db.execute({ sql: `SELECT whatsapp_phone, name FROM users WHERE id = ?`, args: [req.params.id] });
-    if (target.rows.length === 0) return res.status(404).json({ error: "Account not found." });
-    const targetUser = serializeRows(target.rows)[0];
-    if (phoneRegistryKey(targetUser.whatsapp_phone) !== phoneRegistryKey(confirmPhone)) {
-      return res.status(400).json({ error: "Gift cancelled: the WhatsApp number does not match this account." });
-    }
-    await db.execute({
-      sql: `UPDATE users SET paid_post_credits = paid_post_credits + ? WHERE id = ?`,
-      args: [count, req.params.id],
-    });
-    await db.execute({
-      sql: `INSERT INTO post_purchases (id, user_id, plan_name, posts_added, amount_kes, payment_ref) VALUES (?, ?, 'Admin Gift', ?, 0, 'ADMIN-GIFT')`,
-      args: [crypto.randomUUID(), req.params.id, count],
-    });
-    await addSellerNotification(
-      req.params.id,
-      `Admin gifted ${count} post credits to your account (paid posts run for ${PAID_POST_LIFETIME_DAYS} days).`
-    );
-    res.json({ message: `Gifted ${count} posts.` });
+    const userRes = await db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [req.params.id] });
+    const existing = rowToObj(userRes);
+    if (!existing) return res.status(404).json({ error: "Dealer not found." });
+
+    await db.execute({ sql: "UPDATE users SET role = 'private' WHERE id = ?", args: [req.params.id] });
+    res.json({ message: `Removed dealer status for ${existing.name}.` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/api/admin/users/:id/suspension", requireAdminKey, async (req, res) => {
+app.post("/api/admin/listings/:id/moderate", requireAdmin, async (req, res) => {
+  try {
+    const { action } = req.body;
+    const listRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] });
+    const listing = rowToObj(listRes);
+    if (!listing) return res.status(404).json({ error: "Listing not found." });
+
+    const nowIso = new Date().toISOString();
+    if (action === "approve" || action === "mark_safe" || action === "unpause") {
+      const pubAt = listing.published_at || nowIso;
+      await db.execute({
+        sql: "UPDATE listings SET status = 'active', report_reason = NULL, published_at = ?, updated_at = ? WHERE id = ?",
+        args: [pubAt, nowIso, listing.id],
+      });
+    } else if (action === "mark_unsafe" || action === "pause") {
+      await db.execute({
+        sql: "UPDATE listings SET status = 'paused', updated_at = ? WHERE id = ?",
+        args: [nowIso, listing.id],
+      });
+    } else {
+      return res.status(400).json({ error: "Invalid moderation action." });
+    }
+
+    const updatedRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [listing.id] });
+    res.json({ listing: rowToObj(updatedRes) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/users/:id/gift-posts", requireAdmin, async (req, res) => {
+  try {
+    const count = Number(req.body.posts_count || 0);
+    if (!count) return res.status(400).json({ error: "posts_count required." });
+
+    const userRes = await db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [req.params.id] });
+    const user = rowToObj(userRes);
+    if (!user) return res.status(404).json({ error: "User not found." });
+
+    const newCredits = Math.max(0, Number(user.paid_post_credits || 0) + count);
+    await db.execute({ sql: "UPDATE users SET paid_post_credits = ? WHERE id = ?", args: [newCredits, user.id] });
+    await addSellerNotification(user.id, `Admin gifted ${count} post credit(s) to your account.`);
+    res.json({ message: "Gifted posts updated." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/users/:id/suspension", requireAdmin, async (req, res) => {
   try {
     const { suspend, reason } = req.body;
+    const userRes = await db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [req.params.id] });
+    const user = rowToObj(userRes);
+    if (!user) return res.status(404).json({ error: "User not found." });
+
+    await db.execute({
+      sql: "UPDATE users SET is_suspended = ?, suspension_reason = ?, appeal_status = ? WHERE id = ?",
+      args: [
+        suspend ? 1 : 0,
+        suspend ? String(reason || "Account suspended") : null,
+        suspend ? user.appeal_status : "resolved",
+        user.id,
+      ],
+    });
+
     if (suspend) {
       await db.execute({
-        sql: `UPDATE users SET is_suspended = 1, suspension_reason = ?, appeal_status = 'none', appeal_count = 0 WHERE id = ?`,
-        args: [reason || "Suspended for scamming / policy violation", req.params.id],
+        sql: "UPDATE listings SET status = 'paused' WHERE seller_id = ? AND status = 'active'",
+        args: [user.id],
       });
-      await db.execute({ sql: `UPDATE listings SET status = 'paused' WHERE seller_id = ? AND status IN ('active', 'pending_approval')`, args: [req.params.id] });
-      await addSellerNotification(req.params.id, `Account suspended: ${reason || "Policy review required"}. All posts are paused.`);
-      res.json({ message: "Account suspended and all posts paused." });
-    } else {
-      await db.execute({
-        sql: `UPDATE users SET is_suspended = 0, suspension_reason = NULL, appeal_status = 'resolved', appeal_count = 0 WHERE id = ?`,
-        args: [req.params.id],
-      });
-      await db.execute({ sql: `UPDATE listings SET status = 'active' WHERE seller_id = ? AND status = 'paused'`, args: [req.params.id] });
-      await addSellerNotification(req.params.id, "Account restored. Your paused posts are active again.");
-      res.json({ message: "Account restored and posts unpaused." });
-    }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/api/admin/users/:id/appeal", requireAdminKey, async (req, res) => {
-  try {
-    const { action, response } = req.body;
-    if (!["accept", "reject"].includes(action)) return res.status(400).json({ error: "Invalid appeal action." });
-    const message = String(response || "").trim();
-    if (!message) return res.status(400).json({ error: "Enter a response for the seller." });
-
-    await db.execute({
-      sql: `UPDATE users SET appeal_status = ?, appeal_response = ? WHERE id = ?`,
-      args: [action === "accept" ? "accepted" : "rejected", message, req.params.id],
-    });
-    await addSellerNotification(req.params.id, `Suspension appeal ${action === "accept" ? "accepted" : "rejected"}: ${message}`);
-
-    if (action === "accept") {
-      await db.execute({ sql: `UPDATE users SET is_suspended = 0, suspension_reason = NULL, appeal_count = 0 WHERE id = ?`, args: [req.params.id] });
-      await db.execute({ sql: `UPDATE listings SET status = 'active' WHERE seller_id = ? AND status = 'paused'`, args: [req.params.id] });
-    }
-    res.json({ message: `Appeal ${action === "accept" ? "accepted and account restored" : "rejected"}.` });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/admin/sub-account", requireAdminKey, async (req, res) => {
-  try {
-    const r = await db.execute({ sql: `SELECT email, two_factor_enabled, updated_at FROM admin_sub_accounts WHERE id = 'primary'` });
-    if (r.rows.length === 0) return res.json({ configured: false, email: "", two_factor_enabled: false });
-    const account = serializeRows(r.rows)[0];
-    res.json({ configured: true, email: account.email || "", two_factor_enabled: Boolean(account.two_factor_enabled), updated_at: account.updated_at || null });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/api/admin/sub-account", requireAdminKey, async (req, res) => {
-  try {
-    const { email, password, two_factor_enabled } = req.body;
-    const cleanEmail = String(email || "").trim().toLowerCase();
-    if (!cleanEmail) return res.status(400).json({ error: "Enter a sub-admin email address." });
-
-    const existing = await db.execute({ sql: `SELECT password_hash FROM admin_sub_accounts WHERE id = 'primary'` });
-    let passwordHash;
-    if (password) {
-      if (String(password).length < 6) return res.status(400).json({ error: "Sub-admin password must be at least 6 characters." });
-      passwordHash = hashPassword(String(password));
-    } else if (existing.rows.length > 0) {
-      passwordHash = serializeRows(existing.rows)[0].password_hash;
-    } else {
-      return res.status(400).json({ error: "Set a sub-admin password for the first login." });
     }
 
-    await db.execute({
-      sql: `INSERT INTO admin_sub_accounts (id, email, password_hash, two_factor_enabled, updated_at)
-            VALUES ('primary', ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(id) DO UPDATE SET email = excluded.email, password_hash = excluded.password_hash,
-            two_factor_enabled = excluded.two_factor_enabled, updated_at = CURRENT_TIMESTAMP`,
-      args: [cleanEmail, passwordHash, two_factor_enabled ? 1 : 0],
-    });
-    res.json({ message: "Sub-admin email, password, and security settings updated." });
+    res.json({ message: suspend ? "Account suspended." : "Account restored." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/api/admin/sub/login", async (req, res) => {
-  try {
-    const { password } = req.body;
-    const r = await db.execute({ sql: `SELECT * FROM admin_sub_accounts WHERE id = 'primary'` });
-    if (r.rows.length === 0) return res.status(401).json({ error: "Sub-admin is not registered." });
-    const account = serializeRows(r.rows)[0];
-    if (!verifyPassword(String(password || ""), account.password_hash)) return res.status(401).json({ error: "Invalid sub-admin password." });
-
-    if (!Number(account.two_factor_enabled)) {
-      const token = crypto.randomBytes(32).toString("hex");
-      await db.execute({ sql: `UPDATE admin_sub_accounts SET session_token_hash = ?, session_expires_at = ? WHERE id = 'primary'`, args: [hashToken(token), new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString()] });
-      return res.json({ session_token: token, requires_code: false });
-    }
-
-    const code = String(crypto.randomInt(100000, 1000000));
-    await db.execute({ sql: `UPDATE admin_sub_accounts SET code_hash = ?, code_expires_at = ?, code_used_at = NULL WHERE id = 'primary'`, args: [hashToken(code), new Date(Date.now() + 10 * 60 * 1000).toISOString()] });
-    const publicKey = process.env.EMAILJS_PUBLIC_KEY;
-    const privateKey = process.env.EMAILJS_PRIVATE_KEY;
-    if (!publicKey || !privateKey) return res.status(503).json({ error: "Email verification is not configured." });
-    const mail = await fetch("https://api.emailjs.com/api/v1.0/email/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ service_id: EMAILJS_SERVICE_ID, template_id: EMAILJS_TEMPLATE_ID, user_id: publicKey, accessToken: privateKey, template_params: { to_email: account.email, subject: "Wariara sub-admin security code", message: `Your 3D security code is ${code}. It expires in 10 minutes.`, code, code_expiry_minutes: "10" } }) });
-    if (!mail.ok) return res.status(502).json({ error: "Could not send the security code." });
-    res.json({ requires_code: true, email_hint: account.email.replace(/(^.).*(@.*$)/, "$1***$2") });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/api/admin/sub/verify", async (req, res) => {
-  try {
-    const { password, code } = req.body;
-    const r = await db.execute({ sql: `SELECT * FROM admin_sub_accounts WHERE id = 'primary'` });
-    if (r.rows.length === 0) return res.status(401).json({ error: "Sub-admin is not registered." });
-    const account = serializeRows(r.rows)[0];
-    if (!verifyPassword(String(password || ""), account.password_hash)) return res.status(401).json({ error: "Invalid sub-admin password." });
-    if (account.code_used_at || !account.code_expires_at || new Date(account.code_expires_at).getTime() <= Date.now()) return res.status(400).json({ error: "The security code is expired or has already been used." });
-    if (hashToken(String(code || "")) !== account.code_hash) return res.status(400).json({ error: "Invalid security code." });
-    await db.execute({ sql: `UPDATE admin_sub_accounts SET code_used_at = CURRENT_TIMESTAMP WHERE id = 'primary'` });
-    const token = crypto.randomBytes(32).toString("hex");
-    await db.execute({ sql: `UPDATE admin_sub_accounts SET session_token_hash = ?, session_expires_at = ? WHERE id = 'primary'`, args: [hashToken(token), new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString()] });
-    res.json({ session_token: token, requires_code: false });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/api/admin/settings", requireAdminKey, async (req, res) => {
+app.post("/api/admin/settings", requireAdmin, async (req, res) => {
   try {
     const { base_priority_price_kes } = req.body;
     await db.execute({
-      sql: `INSERT OR REPLACE INTO settings (key, value) VALUES ('base_priority_price_kes', ?)`,
+      sql: "INSERT INTO platform_settings (key, value) VALUES ('base_priority_price_kes', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       args: [String(Number(base_priority_price_kes))],
     });
-    res.json({ message: "Priority price updated." });
+    res.json({ message: "Saved." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.put("/api/admin/plans/:id", requireAdminKey, async (req, res) => {
+app.put("/api/admin/plans/:id", requireAdmin, async (req, res) => {
   try {
     const { name, post_count, price_kes } = req.body;
     await db.execute({
-      sql: `UPDATE post_plans SET name = ?, post_count = ?, price_kes = ? WHERE id = ?`,
+      sql: "UPDATE post_plans SET name = ?, post_count = ?, price_kes = ? WHERE id = ?",
       args: [name, Number(post_count), Number(price_kes), req.params.id],
     });
     res.json({ message: "Plan updated." });
@@ -1986,78 +1418,25 @@ app.put("/api/admin/plans/:id", requireAdminKey, async (req, res) => {
   }
 });
 
-app.post("/api/admin/plans", requireAdminKey, async (req, res) => {
+app.post("/api/admin/plans", requireAdmin, async (req, res) => {
   try {
     const { name, post_count, price_kes } = req.body;
     await db.execute({
-      sql: `INSERT INTO post_plans (id, name, post_count, price_kes) VALUES (?, ?, ?, ?)`,
+      sql: "INSERT INTO post_plans (id, name, post_count, price_kes) VALUES (?, ?, ?, ?)",
       args: [crypto.randomUUID(), name, Number(post_count), Number(price_kes)],
     });
-    res.json({ message: "Plan created." });
+    res.json({ message: "Plan added." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/api/admin/priority-plans", requireAdminKey, async (req, res) => {
-  try {
-    const { name, duration_hours, price_kes } = req.body;
-    const duration = Number(duration_hours);
-    const price = Number(price_kes);
-    if (!String(name || "").trim() || !Number.isInteger(duration) || duration < 1 || !Number.isInteger(price) || price < 1) {
-      return res.status(400).json({ error: "Enter a plan name, duration in hours, and price greater than zero." });
-    }
-    await db.execute({
-      sql: `INSERT INTO priority_plans (id, name, duration_hours, price_kes) VALUES (?, ?, ?, ?)`,
-      args: [crypto.randomUUID(), String(name).trim(), duration, price],
-    });
-    res.status(201).json({ message: "Priority plan created." });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.put("/api/admin/priority-plans/:id", requireAdminKey, async (req, res) => {
-  try {
-    const { name, duration_hours, price_kes, active = true } = req.body;
-    const duration = Number(duration_hours);
-    const price = Number(price_kes);
-    if (!String(name || "").trim() || !Number.isInteger(duration) || duration < 1 || !Number.isInteger(price) || price < 1) {
-      return res.status(400).json({ error: "Enter a plan name, duration in hours, and price greater than zero." });
-    }
-    const result = await db.execute({
-      sql: `UPDATE priority_plans SET name = ?, duration_hours = ?, price_kes = ?, active = ? WHERE id = ?`,
-      args: [String(name).trim(), duration, price, active ? 1 : 0, req.params.id],
-    });
-    if (Number(result.rowsAffected || 0) === 0) return res.status(404).json({ error: "Priority plan not found." });
-    res.json({ message: "Priority plan updated." });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete("/api/admin/priority-plans/:id", requireAdminKey, async (req, res) => {
-  try {
-    const result = await db.execute({
-      sql: `DELETE FROM priority_plans WHERE id = ?`,
-      args: [req.params.id],
-    });
-    if (Number(result.rowsAffected || 0) === 0) return res.status(404).json({ error: "Priority plan not found." });
-    res.json({ message: "Priority plan deleted." });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/api/admin/catalog", requireAdminKey, async (req, res) => {
+app.post("/api/admin/catalog", requireAdmin, async (req, res) => {
   try {
     const { vehicle_type, brand, model, body_type } = req.body;
-    if (!vehicle_type || !brand || !model || !body_type) {
-      return res.status(400).json({ error: "All fields required." });
-    }
     await db.execute({
-      sql: `INSERT INTO vehicle_catalog (id, vehicle_type, brand, model, body_type) VALUES (?, ?, ?, ?, ?)`,
-      args: [crypto.randomUUID(), vehicle_type.trim(), brand.trim(), model.trim(), body_type.trim()],
+      sql: "INSERT INTO vehicle_catalog (id, vehicle_type, brand, model, body_type) VALUES (?, ?, ?, ?, ?)",
+      args: [crypto.randomUUID(), vehicle_type, brand, model, body_type],
     });
     res.json({ message: "Catalog item added." });
   } catch (err) {
@@ -2065,21 +1444,13 @@ app.post("/api/admin/catalog", requireAdminKey, async (req, res) => {
   }
 });
 
-app.use((req, res) => {
-  res.status(404).json({ ok: false, error: "API route not found" });
-});
-
-const port = process.env.PORT || 3000;
-const isMainModule = process.argv[1] && path.resolve(process.argv[1]) === __filename;
-
-if (isMainModule) {
-  app.listen(port, () => {
-    console.log(`Wariara Cars Central Rift API running on http://localhost:${port}`);
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Wariara Cars Central Rift API (Turso) running on port ${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("Failed to initialize Turso database:", err);
+    process.exit(1);
   });
-
-  ensureDbReady().catch((err) => {
-    console.error("Database initialization unavailable:", err.message);
-  });
-}
-
-export default app;

@@ -173,6 +173,7 @@ async function initDb() {
       `CREATE TABLE IF NOT EXISTS seller_notifications (
         id TEXT PRIMARY KEY,
         seller_id TEXT NOT NULL,
+        user_id TEXT,
         message TEXT NOT NULL,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
       )`,
@@ -203,6 +204,19 @@ async function initDb() {
       await db.execute(`ALTER TABLE listings ADD COLUMN ${column} ${definition}`);
     }
   }
+  const notificationColumns = await db.execute("PRAGMA table_info(seller_notifications)");
+  const existingNotificationColumns = new Set(notificationColumns.rows.map((row) => row.name));
+  for (const column of ["seller_id", "user_id"]) {
+    if (!existingNotificationColumns.has(column)) {
+      await db.execute(`ALTER TABLE seller_notifications ADD COLUMN ${column} TEXT`);
+    }
+  }
+  await db.execute(`
+    UPDATE seller_notifications
+    SET seller_id = COALESCE(seller_id, user_id),
+        user_id = COALESCE(user_id, seller_id)
+    WHERE seller_id IS NULL OR user_id IS NULL
+  `);
   await db.execute(`
     UPDATE listings
     SET seller_name = COALESCE(
@@ -450,8 +464,8 @@ async function syncExpiredListings() {
 async function addSellerNotification(sellerId, message) {
   if (!sellerId || !message) return;
   await db.execute({
-    sql: "INSERT INTO seller_notifications (id, seller_id, message, created_at) VALUES (?, ?, ?, ?)",
-    args: [crypto.randomUUID(), sellerId, message, new Date().toISOString()],
+    sql: "INSERT INTO seller_notifications (id, seller_id, user_id, message, created_at) VALUES (?, ?, ?, ?, ?)",
+    args: [crypto.randomUUID(), sellerId, sellerId, message, new Date().toISOString()],
   });
 }
 

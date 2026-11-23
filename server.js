@@ -9,7 +9,7 @@ import { createClient } from "@libsql/client";
 const __filename = fileURLToPath(import.meta.url);
 
 const app = express();
-const allowedOrigins = (process.env.FRONTEND_ORIGINS || "http://localhost:3000,http://127.0.0.1:3000")
+const allowedOrigins = (process.env.FRONTEND_ORIGINS || "http://localhost:3000,https://cars.stackcrafts.com")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);

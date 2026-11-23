@@ -1,4 +1,6 @@
 
+
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
@@ -17,6 +19,17 @@ const TURSO_AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "wariara-admin-secret";
 const EMAILJS_PUBLIC_KEY = process.env.EMAILJS_PUBLIC_KEY || "wc0_v2KwNXY2ZonsD";
 const EMAILJS_PRIVATE_KEY = process.env.EMAILJS_PRIVATE_KEY || "nJA7xh7xQMIoQPkEsuCw0";
+const FIREBASE_CONFIG = {
+  apiKey: process.env.FIREBASE_API_KEY || "AIzaSyBea-tl8m56bKlw1dprDd6awM6xFqjeKRI",
+  authDomain: process.env.FIREBASE_AUTH_DOMAIN || "studio-324556329-8e72a.firebaseapp.com",
+  projectId: process.env.FIREBASE_PROJECT_ID || "studio-324556329-8e72a",
+  storageBucket: process.env.FIREBASE_STORAGE_BUCKET || "studio-324556329-8e72a.firebasestorage.app",
+  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || "779859744868",
+  appId: process.env.FIREBASE_APP_ID || "1:779859744868:web:a317e563620c70f456e771",
+};
+const FIREBASE_SIGNING_KEYS_URL = "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com";
+let firebaseSigningKeys = null;
+let firebaseSigningKeysExpiresAt = 0;
 
 if (!TURSO_DATABASE_URL) {
   console.error("Missing TURSO_DATABASE_URL environment variable.");
@@ -31,6 +44,10 @@ const db = createClient({
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 app.use(express.static(path.join(__dirname, "public")));
+
+app.get("/api/config", (req, res) => {
+  res.json({ firebase: FIREBASE_CONFIG });
+});
 
 function rowToObj(result, idx = 0) {
   if (!result || !result.rows || !result.rows[idx]) return null;
@@ -220,6 +237,33 @@ async function initDb() {
   }
 }
 
+function isTransientDatabaseError(error) {
+  const code = error?.cause?.code || error?.code;
+  return [
+    "UND_ERR_SOCKET",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "ECONNRESET",
+    "ECONNREFUSED",
+    "ETIMEDOUT",
+    "EAI_AGAIN",
+  ].includes(code) || (error instanceof TypeError && /fetch failed/i.test(error.message));
+}
+
+async function initializeDatabaseWithRetry() {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await initDb();
+      return;
+    } catch (error) {
+      if (!isTransientDatabaseError(error) || attempt === maxAttempts) throw error;
+      const delayMs = attempt * 1000;
+      console.warn(`Turso connection failed during startup; retrying in ${delayMs / 1000}s (${attempt + 1}/${maxAttempts}).`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 function requireAdmin(req, res, next) {
   const key = req.headers["x-admin-key"] || req.query.admin_key;
   if (!key || key !== ADMIN_SECRET) {
@@ -232,6 +276,93 @@ function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString("hex");
   const derived = crypto.scryptSync(String(password), salt, 64).toString("hex");
   return `${salt}:${derived}`;
+}
+
+async function getFirebaseSigningKeys() {
+  if (firebaseSigningKeys && firebaseSigningKeysExpiresAt > Date.now()) return firebaseSigningKeys;
+
+  let response;
+  try {
+    response = await fetch(FIREBASE_SIGNING_KEYS_URL, { signal: AbortSignal.timeout(10000) });
+  } catch {
+    const error = new Error("Firebase token verification is temporarily unavailable.");
+    error.status = 503;
+    throw error;
+  }
+  if (!response.ok) {
+    const error = new Error("Firebase token verification is temporarily unavailable.");
+    error.status = 503;
+    throw error;
+  }
+  const data = await response.json();
+  if (!Array.isArray(data.keys)) throw new Error("Firebase signing keys response was invalid.");
+
+  const cacheControl = response.headers.get("cache-control") || "";
+  const maxAge = Number(cacheControl.match(/max-age=(\d+)/i)?.[1] || 3600);
+  firebaseSigningKeys = data.keys;
+  firebaseSigningKeysExpiresAt = Date.now() + Math.max(60, maxAge) * 1000;
+  return firebaseSigningKeys;
+}
+
+async function verifyFirebaseIdToken(idToken) {
+  const invalidToken = () => {
+    const error = new Error("A valid Firebase sign-in is required.");
+    error.status = 401;
+    return error;
+  };
+  if (typeof idToken !== "string") throw invalidToken();
+
+  const parts = idToken.split(".");
+  if (parts.length !== 3) throw invalidToken();
+
+  let header;
+  let claims;
+  try {
+    header = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
+    claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  } catch {
+    throw invalidToken();
+  }
+  if (header.alg !== "RS256" || typeof header.kid !== "string") throw invalidToken();
+
+  let keys = await getFirebaseSigningKeys();
+  let signingKey = keys.find((key) => key.kid === header.kid && key.kty === "RSA");
+  if (!signingKey) {
+    firebaseSigningKeysExpiresAt = 0;
+    keys = await getFirebaseSigningKeys();
+    signingKey = keys.find((key) => key.kid === header.kid && key.kty === "RSA");
+  }
+  if (!signingKey) throw invalidToken();
+
+  let signatureIsValid = false;
+  try {
+    signatureIsValid = crypto.verify(
+      "RSA-SHA256",
+      Buffer.from(`${parts[0]}.${parts[1]}`),
+      crypto.createPublicKey({ key: signingKey, format: "jwk" }),
+      Buffer.from(parts[2], "base64url"),
+    );
+  } catch {
+    throw invalidToken();
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (
+    !signatureIsValid ||
+    claims.aud !== FIREBASE_CONFIG.projectId ||
+    claims.iss !== `https://securetoken.google.com/${FIREBASE_CONFIG.projectId}` ||
+    typeof claims.sub !== "string" ||
+    !claims.sub ||
+    typeof claims.email !== "string" ||
+    !Number.isFinite(claims.exp) ||
+    claims.exp <= now ||
+    !Number.isFinite(claims.iat) ||
+    claims.iat > now + 60 ||
+    !Number.isFinite(claims.auth_time) ||
+    claims.auth_time > now + 60
+  ) {
+    throw invalidToken();
+  }
+  return claims;
 }
 
 function verifyPassword(password, stored) {
@@ -437,8 +568,7 @@ app.post("/api/sellers/account", async (req, res) => {
     const {
       name,
       email,
-      password,
-      confirm_password,
+      firebase_id_token,
       whatsapp_phone,
       call_phone,
       role = "private",
@@ -446,27 +576,24 @@ app.post("/api/sellers/account", async (req, res) => {
       accepted_terms,
     } = req.body;
 
-    if (!name || !email || !whatsapp_phone || !call_phone || !password) {
-      return res.status(400).json({ error: "Name, email, WhatsApp, call phone, and password are required." });
+    if (!name || !email || !whatsapp_phone || !call_phone || !firebase_id_token) {
+      return res.status(400).json({ error: "Name, email, WhatsApp, call phone, and Firebase sign-in are required." });
     }
     if (accepted_terms !== true && accepted_terms !== "true") {
       return res.status(400).json({ error: "You must accept the Terms and Conditions to create an account." });
     }
-    if (String(password).length < 6) {
-      return res.status(400).json({ error: "Password must be at least 6 characters." });
-    }
-    if (confirm_password !== undefined && password !== confirm_password) {
-      return res.status(400).json({ error: "Passwords do not match." });
-    }
 
-    const cleanEmail = String(email).trim().toLowerCase();
+    const firebaseUser = await verifyFirebaseIdToken(firebase_id_token);
+    const cleanEmail = firebaseUser.email.trim().toLowerCase();
+    if (String(email).trim().toLowerCase() !== cleanEmail) {
+      return res.status(403).json({ error: "The signed-in Firebase email does not match the seller profile." });
+    }
     const existingRes = await db.execute({
       sql: "SELECT * FROM users WHERE email = ?",
       args: [cleanEmail],
     });
-    if (rowToObj(existingRes)) {
-      return res.status(409).json({ error: "An account with this email already exists. Please sign in instead." });
-    }
+    const existingUser = rowToObj(existingRes);
+    if (existingUser) return res.json({ user: sanitizeUser(existingUser) });
 
     const id = crypto.randomUUID();
     const cleanRole = role === "dealer" ? "dealer" : "private";
@@ -483,7 +610,7 @@ app.post("/api/sellers/account", async (req, res) => {
         id,
         String(name).trim(),
         cleanEmail,
-        hashPassword(password),
+        hashPassword(crypto.randomBytes(32).toString("hex")),
         String(whatsapp_phone).trim(),
         String(call_phone).trim(),
         cleanRole,
@@ -497,28 +624,25 @@ app.post("/api/sellers/account", async (req, res) => {
     const createdRes = await db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [id] });
     res.json({ user: sanitizeUser(rowToObj(createdRes)) });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
 app.post("/api/sellers/login", async (req, res) => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required." });
-    }
+    const { firebase_id_token } = req.body;
+    if (!firebase_id_token) return res.status(400).json({ error: "Firebase sign-in is required." });
 
-    const cleanEmail = String(email).trim().toLowerCase();
+    const firebaseUser = await verifyFirebaseIdToken(firebase_id_token);
+    const cleanEmail = firebaseUser.email.trim().toLowerCase();
     const userRes = await db.execute({ sql: "SELECT * FROM users WHERE email = ?", args: [cleanEmail] });
     const user = rowToObj(userRes);
 
-    if (!user || !verifyPassword(password, user.password_hash)) {
-      return res.status(401).json({ error: "Invalid email or password." });
-    }
+    if (!user) return res.status(404).json({ error: "Seller profile not found. Complete the sign-up form." });
 
     res.json({ user: sanitizeUser(user) });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
@@ -1444,7 +1568,7 @@ app.post("/api/admin/catalog", requireAdmin, async (req, res) => {
   }
 });
 
-initDb()
+initializeDatabaseWithRetry()
   .then(() => {
     app.listen(PORT, () => {
       console.log(`Wariara Cars Central Rift API (Turso) running on port ${PORT}`);

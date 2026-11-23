@@ -1,4 +1,5 @@
 
+
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
@@ -9,7 +10,7 @@ import { createClient } from "@libsql/client";
 const __filename = fileURLToPath(import.meta.url);
 
 const app = express();
-const allowedOrigins = (process.env.FRONTEND_ORIGINS || "http://localhost:3000,https://cars.stackcrafts.c")
+const allowedOrigins = (process.env.FRONTEND_ORIGINS || "http://localhost:3000,http://127.0.0.1:3000")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);

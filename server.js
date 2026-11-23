@@ -1970,7 +1970,15 @@ app.post("/api/admin/listings/:id/moderate", requireAdmin, async (req, res) => {
     }
 
     const updatedRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [listing.id] });
-    res.json({ listing: rowToObj(updatedRes) });
+    const updatedListing = rowToObj(updatedRes);
+    res.json({
+      message: action === "reject"
+        ? `Post rejected. The seller was notified. Reason: ${updatedListing.rejection_reason}`
+        : action === "approve"
+          ? "Post accepted and published. The seller was notified."
+          : `Post ${action === "sold" ? "marked as sold" : action === "pause" ? "paused" : action === "unpause" || action === "mark_safe" ? "restored" : "updated"}.`,
+      listing: updatedListing,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

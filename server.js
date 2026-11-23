@@ -1,4 +1,5 @@
 
+
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -156,7 +157,8 @@ async function initDb() {
         negotiable TEXT DEFAULT 'Yes',
         town TEXT NOT NULL,
         description TEXT NOT NULL,
-        status TEXT DEFAULT 'pending_approval',
+        status TEXT DEFAULT 'pending_approval'
+          CHECK (status IN ('pending_approval', 'active', 'paused', 'reported_suspended', 'unsafe_removed', 'sold', 'rejected', 'expired')),
         rejection_reason TEXT,
         is_paid_post INTEGER DEFAULT 0,
         published_at TEXT,
@@ -228,6 +230,83 @@ async function initDb() {
       await db.execute(`ALTER TABLE listings ADD COLUMN ${column} ${definition}`);
     }
   }
+  const listingsSchemaRes = await db.execute(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'listings'"
+  );
+  const listingsSchema = String(rowToObj(listingsSchemaRes)?.sql || "");
+  const statusCheck = listingsSchema.match(/CHECK\s*\(\s*status\s+IN\s*\(([^)]*)\)\s*\)/i);
+  if (
+    statusCheck &&
+    (!/'rejected'/i.test(statusCheck[1]) || !/'expired'/i.test(statusCheck[1]))
+  ) {
+    await db.batch(
+      [
+        `CREATE TABLE listings_migrated (
+          id TEXT PRIMARY KEY,
+          seller_id TEXT NOT NULL,
+          seller_name TEXT,
+          seller_slug TEXT,
+          whatsapp_phone TEXT,
+          call_phone TEXT,
+          category TEXT NOT NULL,
+          title TEXT NOT NULL,
+          vehicle_type TEXT,
+          condition_type TEXT,
+          brand TEXT,
+          model TEXT,
+          body_type TEXT,
+          year INTEGER,
+          reg_number TEXT,
+          fuel_type TEXT,
+          transmission TEXT,
+          drive_type TEXT,
+          air_con TEXT,
+          engine_cc INTEGER,
+          mileage_km INTEGER,
+          part_name TEXT,
+          part_make TEXT,
+          part_model TEXT,
+          year_from INTEGER,
+          year_to INTEGER,
+          part_condition TEXT,
+          part_authenticity TEXT,
+          price_kes INTEGER NOT NULL,
+          negotiable TEXT DEFAULT 'Yes',
+          town TEXT NOT NULL,
+          description TEXT NOT NULL,
+          status TEXT DEFAULT 'pending_approval'
+            CHECK (status IN ('pending_approval', 'active', 'paused', 'reported_suspended', 'unsafe_removed', 'sold', 'rejected', 'expired')),
+          rejection_reason TEXT,
+          is_paid_post INTEGER DEFAULT 0,
+          published_at TEXT,
+          priority_amount_kes INTEGER DEFAULT 0,
+          priority_date TEXT,
+          report_reason TEXT,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )`,
+        `INSERT INTO listings_migrated (
+          id, seller_id, seller_name, seller_slug, whatsapp_phone, call_phone, category, title,
+          vehicle_type, condition_type, brand, model, body_type, year, reg_number, fuel_type,
+          transmission, drive_type, air_con, engine_cc, mileage_km, part_name, part_make,
+          part_model, year_from, year_to, part_condition, part_authenticity, price_kes, negotiable,
+          town, description, status, rejection_reason, is_paid_post, published_at,
+          priority_amount_kes, priority_date, report_reason, created_at, updated_at
+        )
+        SELECT
+          id, seller_id, seller_name, seller_slug, whatsapp_phone, call_phone, category, title,
+          vehicle_type, condition_type, brand, model, body_type, year, reg_number, fuel_type,
+          transmission, drive_type, air_con, engine_cc, mileage_km, part_name, part_make,
+          part_model, year_from, year_to, part_condition, part_authenticity, price_kes, negotiable,
+          town, description, status, rejection_reason, is_paid_post, published_at,
+          priority_amount_kes, priority_date, report_reason, created_at, updated_at
+        FROM listings`,
+        "DROP TABLE listings",
+        "ALTER TABLE listings_migrated RENAME TO listings",
+      ],
+      "write"
+    );
+  }
   const notificationColumns = await db.execute("PRAGMA table_info(seller_notifications)");
   const existingNotificationColumns = new Set(notificationColumns.rows.map((row) => row.name));
   for (const column of ["seller_id", "user_id"]) {
@@ -241,6 +320,24 @@ async function initDb() {
         user_id = COALESCE(user_id, seller_id)
     WHERE seller_id IS NULL OR user_id IS NULL
   `);
+  const paymentColumns = await db.execute("PRAGMA table_info(payment_notifications)");
+  const existingPaymentColumns = new Set(paymentColumns.rows.map((row) => row.name));
+  const paymentColumnMigrations = [
+    ["id", "TEXT"],
+    ["seller_id", "TEXT"],
+    ["payer_name", "TEXT"],
+    ["payer_phone", "TEXT"],
+    ["payer_email", "TEXT"],
+    ["purpose", "TEXT NOT NULL DEFAULT 'Payment'"],
+    ["amount_kes", "INTEGER DEFAULT 0"],
+    ["payment_ref", "TEXT"],
+    ["created_at", "TEXT"],
+  ];
+  for (const [column, definition] of paymentColumnMigrations) {
+    if (!existingPaymentColumns.has(column)) {
+      await db.execute(`ALTER TABLE payment_notifications ADD COLUMN ${column} ${definition}`);
+    }
+  }
   await db.execute(`
     UPDATE listings
     SET seller_name = COALESCE(
@@ -487,6 +584,8 @@ async function sendSubAdminCode(email, code) {
     error.status = 503;
     throw error;
   }
+  const appName = "Wariara Cars Central Rift Admin";
+  const message = `Your ${appName} verification code is ${code}. It expires in 10 minutes.`;
   let response;
   try {
     response = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
@@ -502,13 +601,22 @@ async function sendSubAdminCode(email, code) {
           to_email: email,
           recipient_email: email,
           user_email: email,
+          to_name: email,
           email,
+          subject: `${appName} verification code`,
+          email_subject: `${appName} verification code`,
+          message,
+          content: message,
+          verification_message: message,
+          code_message: message,
           passcode: code,
           verification_code: code,
           verificationCode: code,
+          otp_code: code,
           code,
           otp: code,
-          app_name: "Wariara Cars Central Rift Admin",
+          app_name: appName,
+          expires_in: "10 minutes",
         },
       }),
     });
@@ -882,11 +990,21 @@ app.get("/api/sellers/lookup", async (req, res) => {
 
 app.get("/api/sellers/:id/notifications", async (req, res) => {
   try {
-    const notifRes = await db.execute({
-      sql: "SELECT * FROM seller_notifications WHERE seller_id = ? ORDER BY created_at DESC LIMIT 50",
-      args: [req.params.id],
+    const [notifRes, paymentsRes] = await Promise.all([
+      db.execute({
+        sql: "SELECT * FROM seller_notifications WHERE seller_id = ? ORDER BY created_at DESC LIMIT 50",
+        args: [req.params.id],
+      }),
+      db.execute({
+        sql: `SELECT id, purpose, amount_kes, created_at
+          FROM payment_notifications WHERE seller_id = ? ORDER BY created_at DESC LIMIT 50`,
+        args: [req.params.id],
+      }),
+    ]);
+    res.json({
+      notifications: rowsToArray(notifRes),
+      paymentNotifications: rowsToArray(paymentsRes),
     });
-    res.json({ notifications: rowsToArray(notifRes) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

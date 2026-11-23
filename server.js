@@ -191,6 +191,36 @@ async function initDb() {
     "write"
   );
 
+  const listingColumns = await db.execute("PRAGMA table_info(listings)");
+  const existingListingColumns = new Set(listingColumns.rows.map((row) => row.name));
+  const listingColumnMigrations = [
+    ["seller_name", "TEXT"],
+    ["seller_slug", "TEXT"],
+    ["updated_at", "TEXT"],
+  ];
+  for (const [column, definition] of listingColumnMigrations) {
+    if (!existingListingColumns.has(column)) {
+      await db.execute(`ALTER TABLE listings ADD COLUMN ${column} ${definition}`);
+    }
+  }
+  await db.execute(`
+    UPDATE listings
+    SET seller_name = COALESCE(
+      NULLIF(seller_name, ''),
+      (SELECT name FROM users WHERE users.id = listings.seller_id)
+    ),
+    seller_slug = COALESCE(
+      NULLIF(seller_slug, ''),
+      (SELECT shop_slug FROM users WHERE users.id = listings.seller_id)
+    ),
+    updated_at = COALESCE(updated_at, created_at)
+    WHERE seller_name IS NULL
+       OR seller_name = ''
+       OR seller_slug IS NULL
+       OR seller_slug = ''
+       OR updated_at IS NULL
+  `);
+
   const settingsCount = await db.execute("SELECT COUNT(*) AS cnt FROM platform_settings");
   if (Number(settingsCount.rows[0]?.[0] || 0) === 0) {
     await db.execute({

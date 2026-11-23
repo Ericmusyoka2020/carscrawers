@@ -489,47 +489,37 @@ async function addPaymentNotification({ sellerId, payerName, payerPhone, payerEm
 }
 
 function validateAllPostFieldsRequired(payload) {
-  const requiredCommon = ["category", "price_kes", "negotiable", "town", "description"];
-  for (const field of requiredCommon) {
-    if (payload[field] === undefined || payload[field] === null || String(payload[field]).trim() === "") {
-      return `Missing required field: ${field}`;
-    }
-  }
-  if (!Array.isArray(payload.photos) || payload.photos.length < 1 || payload.photos.length > 6) {
-    return "Please provide between 1 and 6 photos.";
-  }
-  if (payload.category === "motor") {
-    const motorFields = [
-      "vehicle_type", "condition_type", "brand", "model", "body_type",
-      "year", "reg_number", "fuel_type", "transmission", "drive_type",
-      "air_con", "engine_cc", "mileage_km"
-    ];
-    for (const field of motorFields) {
-      if (payload[field] === undefined || payload[field] === null || String(payload[field]).trim() === "") {
-        return `Missing required motor field: ${field}`;
-      }
-    }
-  } else if (payload.category === "part") {
-    const partFields = [
-      "part_name", "part_make", "part_model", "year_from",
-      "year_to", "part_condition", "part_authenticity"
-    ];
-    for (const field of partFields) {
-      if (payload[field] === undefined || payload[field] === null || String(payload[field]).trim() === "") {
-        return `Missing required spare part field: ${field}`;
-      }
-    }
-  } else {
-    return "Invalid category.";
+  if (!["motor", "part"].includes(payload.category)) return "Select a valid post category.";
+  if (!String(payload.description || "").trim()) return "Description is required.";
+  if (payload.photos !== undefined && (!Array.isArray(payload.photos) || payload.photos.length > 6)) {
+    return "Please provide no more than 6 photos.";
   }
   return null;
 }
 
+function optionalText(value) {
+  const text = String(value ?? "").trim();
+  return text || null;
+}
+
+function optionalNumber(value) {
+  if (value === undefined || value === null || String(value).trim() === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
 function buildListingTitle(payload) {
   if (payload.category === "motor") {
-    return `${payload.year} ${payload.brand} ${payload.model}`.trim();
+    return [
+      optionalNumber(payload.year),
+      optionalText(payload.brand),
+      optionalText(payload.model),
+    ].filter(Boolean).join(" ") || String(payload.description).trim().slice(0, 80);
   }
-  return `${payload.part_name} (${payload.part_make} ${payload.part_model})`.trim();
+  const partName = optionalText(payload.part_name);
+  const vehicle = [optionalText(payload.part_make), optionalText(payload.part_model)].filter(Boolean).join(" ");
+  return (partName && vehicle ? `${partName} (${vehicle})` : partName || vehicle) ||
+    String(payload.description).trim().slice(0, 80);
 }
 
 function sanitizeUser(u) {
@@ -904,7 +894,9 @@ app.get("/api/listings", async (req, res) => {
       min_year = "",
       part_authenticity = "",
       seller_slug = "",
+      exclude_seller_id = "",
       sort = "featured",
+      limit = "",
     } = req.query;
 
     const listRes = await db.execute({
@@ -947,6 +939,7 @@ app.get("/api/listings", async (req, res) => {
     }
     if (part_authenticity) items = items.filter((x) => x.part_authenticity === part_authenticity);
     if (seller_slug) items = items.filter((x) => x.seller_slug === seller_slug);
+    if (exclude_seller_id) items = items.filter((x) => x.seller_id !== String(exclude_seller_id));
 
     const todayStr = todayKenyaDate();
     items = items.map((x) => {
@@ -976,6 +969,13 @@ app.get("/api/listings", async (req, res) => {
         .filter((x) => !sponsoredIds.has(x.id))
         .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
       items = [...sponsored, ...rest];
+    }
+
+    if (limit) {
+      const requestedLimit = Number(limit);
+      if (Number.isFinite(requestedLimit) && requestedLimit > 0) {
+        items = items.slice(0, Math.min(50, Math.floor(requestedLimit)));
+      }
     }
 
     const ids = items.map((x) => x.id);
@@ -1117,29 +1117,29 @@ app.post("/api/listings", async (req, res) => {
         user.call_phone,
         payload.category,
         title,
-        payload.category === "motor" ? payload.vehicle_type : null,
-        payload.category === "motor" ? payload.condition_type : null,
-        payload.category === "motor" ? payload.brand : null,
-        payload.category === "motor" ? payload.model : null,
-        payload.category === "motor" ? payload.body_type : null,
-        payload.category === "motor" ? Number(payload.year) : null,
-        payload.category === "motor" ? String(payload.reg_number).trim() : null,
-        payload.category === "motor" ? payload.fuel_type : null,
-        payload.category === "motor" ? payload.transmission : null,
-        payload.category === "motor" ? payload.drive_type : null,
-        payload.category === "motor" ? payload.air_con : null,
-        payload.category === "motor" ? Number(payload.engine_cc) : null,
-        payload.category === "motor" ? Number(payload.mileage_km) : null,
-        payload.category === "part" ? String(payload.part_name).trim() : null,
-        payload.category === "part" ? String(payload.part_make).trim() : null,
-        payload.category === "part" ? String(payload.part_model).trim() : null,
-        payload.category === "part" ? Number(payload.year_from) : null,
-        payload.category === "part" ? Number(payload.year_to) : null,
-        payload.category === "part" ? payload.part_condition : null,
-        payload.category === "part" ? payload.part_authenticity : null,
-        Number(payload.price_kes),
-        payload.negotiable,
-        String(payload.town).trim(),
+        payload.category === "motor" ? optionalText(payload.vehicle_type) : null,
+        payload.category === "motor" ? optionalText(payload.condition_type) : null,
+        payload.category === "motor" ? optionalText(payload.brand) : null,
+        payload.category === "motor" ? optionalText(payload.model) : null,
+        payload.category === "motor" ? optionalText(payload.body_type) : null,
+        payload.category === "motor" ? optionalNumber(payload.year) : null,
+        payload.category === "motor" ? optionalText(payload.reg_number) : null,
+        payload.category === "motor" ? optionalText(payload.fuel_type) : null,
+        payload.category === "motor" ? optionalText(payload.transmission) : null,
+        payload.category === "motor" ? optionalText(payload.drive_type) : null,
+        payload.category === "motor" ? optionalText(payload.air_con) : null,
+        payload.category === "motor" ? optionalNumber(payload.engine_cc) : null,
+        payload.category === "motor" ? optionalNumber(payload.mileage_km) : null,
+        payload.category === "part" ? optionalText(payload.part_name) : null,
+        payload.category === "part" ? optionalText(payload.part_make) : null,
+        payload.category === "part" ? optionalText(payload.part_model) : null,
+        payload.category === "part" ? optionalNumber(payload.year_from) : null,
+        payload.category === "part" ? optionalNumber(payload.year_to) : null,
+        payload.category === "part" ? optionalText(payload.part_condition) : null,
+        payload.category === "part" ? optionalText(payload.part_authenticity) : null,
+        optionalNumber(payload.price_kes) ?? 0,
+        optionalText(payload.negotiable) || "Yes",
+        optionalText(payload.town) || "Nakuru",
         String(payload.description).trim(),
         usedPaidCredit ? 1 : 0,
         nowIso,
@@ -1147,7 +1147,7 @@ app.post("/api/listings", async (req, res) => {
       ],
     });
 
-    for (let idx = 0; idx < payload.photos.slice(0, 6).length; idx++) {
+    for (let idx = 0; idx < (payload.photos || []).slice(0, 6).length; idx++) {
       await db.execute({
         sql: "INSERT INTO listing_photos (id, listing_id, photo_data, sort_order) VALUES (?, ?, ?, ?)",
         args: [crypto.randomUUID(), id, payload.photos[idx], idx],
@@ -1192,41 +1192,43 @@ app.put("/api/listings/:id", async (req, res) => {
         WHERE id = ?`,
       args: [
         buildListingTitle(payload),
-        existing.category === "motor" ? payload.vehicle_type : null,
-        existing.category === "motor" ? payload.condition_type : null,
-        existing.category === "motor" ? payload.brand : null,
-        existing.category === "motor" ? payload.model : null,
-        existing.category === "motor" ? payload.body_type : null,
-        existing.category === "motor" ? Number(payload.year) : null,
-        existing.category === "motor" ? String(payload.reg_number).trim() : null,
-        existing.category === "motor" ? payload.fuel_type : null,
-        existing.category === "motor" ? payload.transmission : null,
-        existing.category === "motor" ? payload.drive_type : null,
-        existing.category === "motor" ? payload.air_con : null,
-        existing.category === "motor" ? Number(payload.engine_cc) : null,
-        existing.category === "motor" ? Number(payload.mileage_km) : null,
-        existing.category === "part" ? String(payload.part_name).trim() : null,
-        existing.category === "part" ? String(payload.part_make).trim() : null,
-        existing.category === "part" ? String(payload.part_model).trim() : null,
-        existing.category === "part" ? Number(payload.year_from) : null,
-        existing.category === "part" ? Number(payload.year_to) : null,
-        existing.category === "part" ? payload.part_condition : null,
-        existing.category === "part" ? payload.part_authenticity : null,
-        Number(payload.price_kes),
-        payload.negotiable,
-        String(payload.town).trim(),
+        existing.category === "motor" ? optionalText(payload.vehicle_type) : null,
+        existing.category === "motor" ? optionalText(payload.condition_type) : null,
+        existing.category === "motor" ? optionalText(payload.brand) : null,
+        existing.category === "motor" ? optionalText(payload.model) : null,
+        existing.category === "motor" ? optionalText(payload.body_type) : null,
+        existing.category === "motor" ? optionalNumber(payload.year) : null,
+        existing.category === "motor" ? optionalText(payload.reg_number) : null,
+        existing.category === "motor" ? optionalText(payload.fuel_type) : null,
+        existing.category === "motor" ? optionalText(payload.transmission) : null,
+        existing.category === "motor" ? optionalText(payload.drive_type) : null,
+        existing.category === "motor" ? optionalText(payload.air_con) : null,
+        existing.category === "motor" ? optionalNumber(payload.engine_cc) : null,
+        existing.category === "motor" ? optionalNumber(payload.mileage_km) : null,
+        existing.category === "part" ? optionalText(payload.part_name) : null,
+        existing.category === "part" ? optionalText(payload.part_make) : null,
+        existing.category === "part" ? optionalText(payload.part_model) : null,
+        existing.category === "part" ? optionalNumber(payload.year_from) : null,
+        existing.category === "part" ? optionalNumber(payload.year_to) : null,
+        existing.category === "part" ? optionalText(payload.part_condition) : null,
+        existing.category === "part" ? optionalText(payload.part_authenticity) : null,
+        optionalNumber(payload.price_kes) ?? 0,
+        optionalText(payload.negotiable) || "Yes",
+        optionalText(payload.town) || "Nakuru",
         String(payload.description).trim(),
         new Date().toISOString(),
         existing.id,
       ],
     });
 
-    await db.execute({ sql: "DELETE FROM listing_photos WHERE listing_id = ?", args: [existing.id] });
-    for (let idx = 0; idx < payload.photos.slice(0, 6).length; idx++) {
-      await db.execute({
-        sql: "INSERT INTO listing_photos (id, listing_id, photo_data, sort_order) VALUES (?, ?, ?, ?)",
-        args: [crypto.randomUUID(), existing.id, payload.photos[idx], idx],
-      });
+    if (Array.isArray(payload.photos)) {
+      await db.execute({ sql: "DELETE FROM listing_photos WHERE listing_id = ?", args: [existing.id] });
+      for (let idx = 0; idx < payload.photos.slice(0, 6).length; idx++) {
+        await db.execute({
+          sql: "INSERT INTO listing_photos (id, listing_id, photo_data, sort_order) VALUES (?, ?, ?, ?)",
+          args: [crypto.randomUUID(), existing.id, payload.photos[idx], idx],
+        });
+      }
     }
 
     const updatedRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [existing.id] });
@@ -1238,17 +1240,23 @@ app.put("/api/listings/:id", async (req, res) => {
 
 app.patch("/api/listings/:id/status", async (req, res) => {
   try {
-    const { status } = req.body;
-    if (!["active", "paused"].includes(status)) {
-      return res.status(400).json({ error: "Status must be active or paused." });
+    const { status, seller_id } = req.body;
+    if (!["active", "paused", "sold"].includes(status)) {
+      return res.status(400).json({ error: "Status must be active, paused, or sold." });
     }
-    await db.execute({
-      sql: "UPDATE listings SET status = ?, updated_at = ? WHERE id = ?",
-      args: [status, new Date().toISOString(), req.params.id],
+    const listingRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] });
+    const listing = rowToObj(listingRes);
+    if (!listing) return res.status(404).json({ error: "Listing not found." });
+    if (!seller_id || listing.seller_id !== seller_id) {
+      return res.status(403).json({ error: "You can only change the status of your own post." });
+    }
+    const update = await db.execute({
+      sql: "UPDATE listings SET status = ?, updated_at = ? WHERE id = ? AND seller_id = ?",
+      args: [status, new Date().toISOString(), req.params.id, seller_id],
     });
+    if (!Number(update.rowsAffected)) return res.status(404).json({ error: "Listing not found." });
     const updatedRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] });
     const updated = rowToObj(updatedRes);
-    if (!updated) return res.status(404).json({ error: "Listing not found." });
     res.json({ listing: updated });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1405,6 +1413,80 @@ app.get("/api/admin/overview", requireAdmin, async (req, res) => {
   }
 });
 
+app.put("/api/admin/listings/:id", requireAdmin, async (req, res) => {
+  try {
+    const existingRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] });
+    const existing = rowToObj(existingRes);
+    if (!existing) return res.status(404).json({ error: "Listing not found." });
+
+    const payload = req.body || {};
+    if (!String(payload.description ?? existing.description ?? "").trim()) {
+      return res.status(400).json({ error: "Description is required." });
+    }
+    if (payload.photos !== undefined && (!Array.isArray(payload.photos) || payload.photos.length > 6)) {
+      return res.status(400).json({ error: "Please provide no more than 6 photos." });
+    }
+
+    const textFields = [
+      "title", "seller_name", "seller_slug", "whatsapp_phone", "call_phone", "negotiable", "town", "description",
+      "vehicle_type", "condition_type", "brand", "model", "body_type", "reg_number", "fuel_type",
+      "transmission", "drive_type", "air_con", "part_name", "part_make", "part_model",
+      "part_condition", "part_authenticity",
+    ];
+    const numberFields = ["price_kes", "year", "engine_cc", "mileage_km", "year_from", "year_to"];
+    const updates = [];
+    const args = [];
+
+    for (const field of textFields) {
+      if (Object.hasOwn(payload, field)) {
+        updates.push(`${field} = ?`);
+        if (field === "description") {
+          args.push(String(payload[field] ?? "").trim());
+        } else if (field === "title") {
+          args.push(optionalText(payload[field]) || existing.title || buildListingTitle({ ...existing, ...payload }));
+        } else if (field === "seller_name") {
+          args.push(optionalText(payload[field]) || existing.seller_name);
+        } else if (field === "town") {
+          args.push(optionalText(payload[field]) || "Nakuru");
+        } else if (field === "negotiable") {
+          args.push(optionalText(payload[field]) || "Yes");
+        } else {
+          args.push(optionalText(payload[field]));
+        }
+      }
+    }
+    for (const field of numberFields) {
+      if (Object.hasOwn(payload, field)) {
+        updates.push(`${field} = ?`);
+        args.push(optionalNumber(payload[field]) ?? (field === "price_kes" ? 0 : null));
+      }
+    }
+    if (updates.length) {
+      updates.push("updated_at = ?");
+      args.push(new Date().toISOString(), req.params.id);
+      await db.execute({
+        sql: `UPDATE listings SET ${updates.join(", ")} WHERE id = ?`,
+        args,
+      });
+    }
+
+    if (Array.isArray(payload.photos)) {
+      await db.execute({ sql: "DELETE FROM listing_photos WHERE listing_id = ?", args: [req.params.id] });
+      for (let index = 0; index < payload.photos.length; index++) {
+        await db.execute({
+          sql: "INSERT INTO listing_photos (id, listing_id, photo_data, sort_order) VALUES (?, ?, ?, ?)",
+          args: [crypto.randomUUID(), req.params.id, payload.photos[index], index],
+        });
+      }
+    }
+
+    const updatedRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] });
+    res.json({ message: "Listing updated.", listing: rowToObj(updatedRes) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/api/admin/dealers", requireAdmin, async (req, res) => {
   try {
     const { user_id, name, email, whatsapp_phone, call_phone, town = "Nakuru" } = req.body;
@@ -1499,6 +1581,11 @@ app.post("/api/admin/listings/:id/moderate", requireAdmin, async (req, res) => {
     } else if (action === "mark_unsafe" || action === "pause") {
       await db.execute({
         sql: "UPDATE listings SET status = 'paused', updated_at = ? WHERE id = ?",
+        args: [nowIso, listing.id],
+      });
+    } else if (action === "sold") {
+      await db.execute({
+        sql: "UPDATE listings SET status = 'sold', updated_at = ? WHERE id = ?",
         args: [nowIso, listing.id],
       });
     } else {

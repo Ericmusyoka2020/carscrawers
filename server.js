@@ -1,5 +1,4 @@
 
-
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -16,9 +15,11 @@ const PORT = process.env.PORT || 3000;
 
 const TURSO_DATABASE_URL = process.env.TURSO_DATABASE_URL;
 const TURSO_AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN;
-const ADMIN_SECRET = process.env.ADMIN_SECRET || "wariara-admin-secret";
-const EMAILJS_PUBLIC_KEY = process.env.EMAILJS_PUBLIC_KEY || "wc0_v2KwNXY2ZonsD";
-const EMAILJS_PRIVATE_KEY = process.env.EMAILJS_PRIVATE_KEY || "nJA7xh7xQMIoQPkEsuCw0";
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
+const EMAILJS_PUBLIC_KEY = process.env.EMAILJS_PUBLIC_KEY || "";
+const EMAILJS_PRIVATE_KEY = process.env.EMAILJS_PRIVATE_KEY || "";
+const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || "";
+const EMAILJS_TEMPLATE_ID = process.env.EMAILJS_TEMPLATE_ID || "";
 const FIREBASE_CONFIG = {
   apiKey: process.env.FIREBASE_API_KEY || "AIzaSyBea-tl8m56bKlw1dprDd6awM6xFqjeKRI",
   authDomain: process.env.FIREBASE_AUTH_DOMAIN || "studio-324556329-8e72a.firebaseapp.com",
@@ -156,6 +157,7 @@ async function initDb() {
         town TEXT NOT NULL,
         description TEXT NOT NULL,
         status TEXT DEFAULT 'pending_approval',
+        rejection_reason TEXT,
         is_paid_post INTEGER DEFAULT 0,
         published_at TEXT,
         priority_amount_kes INTEGER DEFAULT 0,
@@ -188,6 +190,27 @@ async function initDb() {
         payment_ref TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
       )`,
+      `CREATE TABLE IF NOT EXISTS sub_admins (
+        slot INTEGER PRIMARY KEY CHECK (slot BETWEEN 1 AND 4),
+        pin_hash TEXT NOT NULL,
+        email TEXT,
+        email_code_enabled INTEGER NOT NULL DEFAULT 0,
+        code_hash TEXT,
+        code_expires_at TEXT,
+        code_failed_attempts INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS sub_admin_sessions (
+        token_hash TEXT PRIMARY KEY,
+        slot INTEGER NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS sub_admin_login_limits (
+        ip_hash TEXT PRIMARY KEY,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        locked_until TEXT
+      )`,
     ],
     "write"
   );
@@ -198,6 +221,7 @@ async function initDb() {
     ["seller_name", "TEXT"],
     ["seller_slug", "TEXT"],
     ["updated_at", "TEXT"],
+    ["rejection_reason", "TEXT"],
   ];
   for (const [column, definition] of listingColumnMigrations) {
     if (!existingListingColumns.has(column)) {
@@ -308,11 +332,36 @@ async function initializeDatabaseWithRetry() {
   }
 }
 
-function requireAdmin(req, res, next) {
-  const key = req.headers["x-admin-key"] || req.query.admin_key;
-  if (!key || key !== ADMIN_SECRET) {
-    return res.status(401).json({ error: "Unauthorized: invalid admin key." });
+async function requireAdmin(req, res, next) {
+  const key = req.get("x-admin-key");
+  if (key && ADMIN_SECRET && key === ADMIN_SECRET) {
+    req.adminRole = "owner";
+    return next();
   }
+  if (typeof key !== "string" || !key) {
+    return res.status(401).json({ error: "Unauthorized: invalid admin session." });
+  }
+  try {
+    const tokenHash = crypto.createHash("sha256").update(key).digest("hex");
+    const sessionRes = await db.execute({
+      sql: "SELECT slot FROM sub_admin_sessions WHERE token_hash = ? AND expires_at > ?",
+      args: [tokenHash, new Date().toISOString()],
+    });
+    const session = rowToObj(sessionRes);
+    if (!session) return res.status(401).json({ error: "Sub-admin session expired. Please sign in again." });
+    req.adminRole = "subadmin";
+    req.subAdminSlot = Number(session.slot);
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
+function requireOwnerAdmin(req, res, next) {
+  if (!ADMIN_SECRET || req.get("x-admin-key") !== ADMIN_SECRET) {
+    return res.status(403).json({ error: "Only the primary admin can manage sub-admin PINs." });
+  }
+  req.adminRole = "owner";
   next();
 }
 
@@ -416,6 +465,65 @@ function verifyPassword(password, stored) {
   const keyBuf = Buffer.from(keyHex, "hex");
   if (derived.length !== keyBuf.length) return false;
   return crypto.timingSafeEqual(derived, keyBuf);
+}
+
+function hashSubAdminPin(pin) {
+  return hashPassword(pin);
+}
+
+function hashSubAdminCode(code) {
+  return crypto.createHash("sha256").update(String(code)).digest("hex");
+}
+
+function maskEmail(email) {
+  const [name, domain] = String(email || "").split("@");
+  if (!name || !domain) return "";
+  return `${name.slice(0, 1)}${"*".repeat(Math.max(2, name.length - 1))}@${domain}`;
+}
+
+async function sendSubAdminCode(email, code) {
+  if (!EMAILJS_PUBLIC_KEY || !EMAILJS_PRIVATE_KEY || !EMAILJS_SERVICE_ID || !EMAILJS_TEMPLATE_ID) {
+    const error = new Error("Email verification is not configured. Set the EmailJS service, template, public, and private keys on the API server.");
+    error.status = 503;
+    throw error;
+  }
+  let response;
+  try {
+    response = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(15000),
+      body: JSON.stringify({
+        service_id: EMAILJS_SERVICE_ID,
+        template_id: EMAILJS_TEMPLATE_ID,
+        user_id: EMAILJS_PUBLIC_KEY,
+        accessToken: EMAILJS_PRIVATE_KEY,
+        template_params: {
+          to_email: email,
+          recipient_email: email,
+          user_email: email,
+          email,
+          passcode: code,
+          verification_code: code,
+          verificationCode: code,
+          code,
+          otp: code,
+          app_name: "Wariara Cars Central Rift Admin",
+        },
+      }),
+    });
+  } catch (cause) {
+    const error = new Error("Could not send the verification email. Please try again.");
+    error.status = 502;
+    error.cause = cause;
+    throw error;
+  }
+  if (!response.ok) {
+    console.error(`EmailJS rejected a sub-admin verification email (HTTP ${response.status}).`);
+    const error = new Error("EmailJS could not send the verification email. Check the EmailJS service and template configuration.");
+    error.status = 502;
+    throw error;
+  }
 }
 
 function slugify(str) {
@@ -534,7 +642,9 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "Wariara Cars Central Rift API (Turso)",
-    emailjsConfigured: Boolean(EMAILJS_PUBLIC_KEY && EMAILJS_PRIVATE_KEY),
+    emailjsConfigured: Boolean(
+      EMAILJS_PUBLIC_KEY && EMAILJS_PRIVATE_KEY && EMAILJS_SERVICE_ID && EMAILJS_TEMPLATE_ID
+    ),
   });
 });
 
@@ -557,7 +667,6 @@ app.get("/api/meta", async (req, res) => {
       catalog: rowsToArray(catalogRes),
       plans: rowsToArray(plansRes),
       settings,
-      emailjsPublicKey: EMAILJS_PUBLIC_KEY,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1363,6 +1472,256 @@ app.post("/api/listings/:id/prioritize", async (req, res) => {
 
 // ================= ADMIN ROUTES =================
 
+function subAdminIpHash(req) {
+  const address = req.ip || req.socket.remoteAddress || "unknown";
+  return crypto.createHash("sha256").update(String(address)).digest("hex");
+}
+
+async function checkSubAdminLoginLimit(req, res) {
+  const ipHash = subAdminIpHash(req);
+  const limitRes = await db.execute({
+    sql: "SELECT attempts, locked_until FROM sub_admin_login_limits WHERE ip_hash = ?",
+    args: [ipHash],
+  });
+  const limit = rowToObj(limitRes);
+  if (limit?.locked_until && new Date(limit.locked_until).getTime() > Date.now()) {
+    res.status(429).json({ error: "Too many sign-in attempts. Try again in 15 minutes." });
+    return null;
+  }
+  if (limit?.locked_until) {
+    await db.execute({ sql: "DELETE FROM sub_admin_login_limits WHERE ip_hash = ?", args: [ipHash] });
+  }
+  return { ipHash, attempts: Number(limit?.attempts || 0) };
+}
+
+async function failSubAdminLogin(res, ipHash, attempts) {
+  const nextAttempts = attempts + 1;
+  const lockedUntil = nextAttempts >= 5
+    ? new Date(Date.now() + 15 * 60 * 1000).toISOString()
+    : null;
+  await db.execute({
+    sql: `INSERT INTO sub_admin_login_limits (ip_hash, attempts, locked_until) VALUES (?, ?, ?)
+      ON CONFLICT(ip_hash) DO UPDATE SET attempts = excluded.attempts, locked_until = excluded.locked_until`,
+    args: [ipHash, nextAttempts, lockedUntil],
+  });
+  if (nextAttempts >= 5) {
+    res.status(429).json({ error: "Too many sign-in attempts. Try again in 15 minutes." });
+    return;
+  }
+  res.status(401).json({ error: "Invalid PIN or verification code." });
+}
+
+async function findSubAdminByPin(pin) {
+  const adminsRes = await db.execute("SELECT * FROM sub_admins");
+  let match = null;
+  for (const admin of rowsToArray(adminsRes)) {
+    if (verifyPassword(pin, admin.pin_hash)) match = admin;
+  }
+  return match;
+}
+
+async function createSubAdminSession(slot) {
+  const token = crypto.randomBytes(32).toString("base64url");
+  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+  const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
+  await db.execute({ sql: "DELETE FROM sub_admin_sessions WHERE expires_at <= ?", args: [new Date().toISOString()] });
+  await db.execute({
+    sql: "INSERT INTO sub_admin_sessions (token_hash, slot, expires_at) VALUES (?, ?, ?)",
+    args: [tokenHash, slot, expiresAt],
+  });
+  return { session_token: token, expires_at: expiresAt };
+}
+
+app.post("/api/admin/sub/login", async (req, res) => {
+  try {
+    const limiter = await checkSubAdminLoginLimit(req, res);
+    if (!limiter) return;
+    const pin = String(req.body?.pin || "");
+    if (!/^\d{6}$/.test(pin)) return failSubAdminLogin(res, limiter.ipHash, limiter.attempts);
+    const admin = await findSubAdminByPin(pin);
+    if (!admin) return failSubAdminLogin(res, limiter.ipHash, limiter.attempts);
+    await db.execute({ sql: "DELETE FROM sub_admin_login_limits WHERE ip_hash = ?", args: [limiter.ipHash] });
+
+    if (Number(admin.email_code_enabled)) {
+      const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+      await db.execute({
+        sql: "UPDATE sub_admins SET code_hash = ?, code_expires_at = ?, code_failed_attempts = 0 WHERE slot = ?",
+        args: [hashSubAdminCode(code), expiresAt, admin.slot],
+      });
+      try {
+        await sendSubAdminCode(admin.email, code);
+      } catch (error) {
+        await db.execute({
+          sql: "UPDATE sub_admins SET code_hash = NULL, code_expires_at = NULL WHERE slot = ?",
+          args: [admin.slot],
+        });
+        throw error;
+      }
+      return res.json({ requires_code: true, email_hint: maskEmail(admin.email) });
+    }
+
+    return res.json(await createSubAdminSession(admin.slot));
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+app.post("/api/admin/sub/verify", async (req, res) => {
+  try {
+    const limiter = await checkSubAdminLoginLimit(req, res);
+    if (!limiter) return;
+    const pin = String(req.body?.pin || "");
+    const code = String(req.body?.code || "");
+    const admin = /^\d{6}$/.test(pin) && /^\d{6}$/.test(code)
+      ? await findSubAdminByPin(pin)
+      : null;
+    const codeHash = admin?.code_hash ? Buffer.from(hashSubAdminCode(code), "hex") : Buffer.alloc(0);
+    const expectedHash = admin?.code_hash ? Buffer.from(admin.code_hash, "hex") : Buffer.alloc(0);
+    const codeMatches = codeHash.length === expectedHash.length &&
+      codeHash.length > 0 &&
+      crypto.timingSafeEqual(codeHash, expectedHash);
+    if (
+      !admin ||
+      !Number(admin.email_code_enabled) ||
+      !admin.code_expires_at ||
+      new Date(admin.code_expires_at).getTime() <= Date.now() ||
+      !codeMatches
+    ) {
+      if (admin && Number(admin.email_code_enabled)) {
+        const failedAttempts = Number(admin.code_failed_attempts || 0) + 1;
+        await db.execute({
+          sql: `UPDATE sub_admins SET code_failed_attempts = ?, code_hash = ?, code_expires_at = ?
+            WHERE slot = ?`,
+          args: [
+            failedAttempts,
+            failedAttempts >= 5 ? null : admin.code_hash,
+            failedAttempts >= 5 ? null : admin.code_expires_at,
+            admin.slot,
+          ],
+        });
+      }
+      return failSubAdminLogin(res, limiter.ipHash, limiter.attempts);
+    }
+
+    await db.execute({ sql: "DELETE FROM sub_admin_login_limits WHERE ip_hash = ?", args: [limiter.ipHash] });
+    await db.execute({
+      sql: "UPDATE sub_admins SET code_hash = NULL, code_expires_at = NULL, code_failed_attempts = 0 WHERE slot = ?",
+      args: [admin.slot],
+    });
+    return res.json(await createSubAdminSession(admin.slot));
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+app.post("/api/admin/sub/logout", requireAdmin, async (req, res) => {
+  try {
+    if (req.adminRole === "subadmin") {
+      const token = req.get("x-admin-key");
+      const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+      await db.execute({ sql: "DELETE FROM sub_admin_sessions WHERE token_hash = ?", args: [tokenHash] });
+    }
+    res.json({ message: "Signed out." });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/admin/sub-accounts", requireOwnerAdmin, async (req, res) => {
+  try {
+    const adminsRes = await db.execute("SELECT slot, email, email_code_enabled FROM sub_admins ORDER BY slot");
+    const bySlot = new Map(rowsToArray(adminsRes).map((admin) => [Number(admin.slot), admin]));
+    res.json({
+      emailjs_configured: Boolean(
+        EMAILJS_PUBLIC_KEY && EMAILJS_PRIVATE_KEY && EMAILJS_SERVICE_ID && EMAILJS_TEMPLATE_ID
+      ),
+      accounts: [1, 2, 3, 4].map((slot) => {
+        const admin = bySlot.get(slot);
+        return {
+          slot,
+          active: Boolean(admin),
+          email: admin?.email || "",
+          email_code_enabled: Boolean(Number(admin?.email_code_enabled || 0)),
+        };
+      }),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/admin/sub-accounts", requireOwnerAdmin, async (req, res) => {
+  try {
+    const slots = req.body?.accounts;
+    if (!Array.isArray(slots) || slots.length !== 4) {
+      return res.status(400).json({ error: "Provide exactly four sub-admin slots." });
+    }
+    const existingRes = await db.execute("SELECT * FROM sub_admins");
+    const existingBySlot = new Map(rowsToArray(existingRes).map((admin) => [Number(admin.slot), admin]));
+    const normalized = [];
+
+    for (let index = 0; index < 4; index++) {
+      const input = slots[index] || {};
+      const slot = index + 1;
+      if (Number(input.slot) !== slot) return res.status(400).json({ error: "Sub-admin slots must be numbered 1 to 4." });
+      if (!input.active) {
+        normalized.push({ slot, active: false });
+        continue;
+      }
+      const email = String(input.email || "").trim().toLowerCase();
+      const codeEnabled = Boolean(input.email_code_enabled);
+      const pin = String(input.pin || "").trim();
+      const existing = existingBySlot.get(slot);
+      if (pin && !/^\d{6}$/.test(pin)) {
+        return res.status(400).json({ error: `Sub-admin ${slot}: PIN must be exactly 6 digits.` });
+      }
+      if (!existing && !pin) {
+        return res.status(400).json({ error: `Sub-admin ${slot}: enter a 6-digit PIN to create this login.` });
+      }
+      if (codeEnabled && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ error: `Sub-admin ${slot}: a valid email is required when email codes are enabled.` });
+      }
+      normalized.push({
+        slot,
+        active: true,
+        email: email || null,
+        codeEnabled,
+        pinHash: pin ? hashSubAdminPin(pin) : existing.pin_hash,
+        pin,
+      });
+    }
+
+    for (const account of normalized.filter((item) => item.active && item.pin)) {
+      for (const other of normalized) {
+        if (other.active && other.slot !== account.slot && verifyPassword(account.pin, other.pinHash)) {
+          return res.status(400).json({ error: "Each sub-admin must have a different PIN." });
+        }
+      }
+    }
+
+    for (const account of normalized) {
+      await db.execute({ sql: "DELETE FROM sub_admin_sessions WHERE slot = ?", args: [account.slot] });
+      if (!account.active) {
+        await db.execute({ sql: "DELETE FROM sub_admins WHERE slot = ?", args: [account.slot] });
+        continue;
+      }
+      await db.execute({
+        sql: `INSERT INTO sub_admins
+          (slot, pin_hash, email, email_code_enabled, code_hash, code_expires_at, code_failed_attempts, updated_at)
+          VALUES (?, ?, ?, ?, NULL, NULL, 0, ?)
+          ON CONFLICT(slot) DO UPDATE SET pin_hash = excluded.pin_hash, email = excluded.email,
+            email_code_enabled = excluded.email_code_enabled, code_hash = NULL,
+            code_expires_at = NULL, code_failed_attempts = 0, updated_at = excluded.updated_at`,
+        args: [account.slot, account.pinHash, account.email, account.codeEnabled ? 1 : 0, new Date().toISOString()],
+      });
+    }
+    res.json({ message: "Sub-admin logins saved. Existing sessions have been signed out." });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get("/api/admin/overview", requireAdmin, async (req, res) => {
   try {
     await syncExpiredListings();
@@ -1572,12 +1931,30 @@ app.post("/api/admin/listings/:id/moderate", requireAdmin, async (req, res) => {
     if (!listing) return res.status(404).json({ error: "Listing not found." });
 
     const nowIso = new Date().toISOString();
+    if (action === "approve" && listing.status !== "pending_approval") {
+      return res.status(409).json({ error: "Only pending posts can be approved." });
+    }
     if (action === "approve" || action === "mark_safe" || action === "unpause") {
       const pubAt = listing.published_at || nowIso;
       await db.execute({
-        sql: "UPDATE listings SET status = 'active', report_reason = NULL, published_at = ?, updated_at = ? WHERE id = ?",
+        sql: "UPDATE listings SET status = 'active', report_reason = NULL, rejection_reason = NULL, published_at = ?, updated_at = ? WHERE id = ?",
         args: [pubAt, nowIso, listing.id],
       });
+      if (action === "approve" && listing.status === "pending_approval") {
+        await addSellerNotification(listing.seller_id, `Your post "${listing.title}" was approved and is now visible in the marketplace.`);
+      }
+    } else if (action === "reject") {
+      const reason = String(req.body?.reason || "").trim();
+      if (listing.status !== "pending_approval") {
+        return res.status(409).json({ error: "Only pending posts can be rejected." });
+      }
+      if (!reason) return res.status(400).json({ error: "A rejection reason is required." });
+      if (reason.length > 500) return res.status(400).json({ error: "Rejection reason must be 500 characters or fewer." });
+      await db.execute({
+        sql: "UPDATE listings SET status = 'rejected', rejection_reason = ?, updated_at = ? WHERE id = ?",
+        args: [reason, nowIso, listing.id],
+      });
+      await addSellerNotification(listing.seller_id, `Your post "${listing.title}" was rejected. Reason: ${reason}`);
     } else if (action === "mark_unsafe" || action === "pause") {
       await db.execute({
         sql: "UPDATE listings SET status = 'paused', updated_at = ? WHERE id = ?",

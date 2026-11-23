@@ -1,4 +1,4 @@
-import "dotenv/config";
+
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
@@ -7,7 +7,6 @@ import { fileURLToPath } from "url";
 import { createClient } from "@libsql/client";
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 const allowedOrigins = (process.env.FRONTEND_ORIGINS || "http://localhost:3000,http://127.0.0.1:3000")
@@ -30,34 +29,11 @@ app.get("/api/health", (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  const frontendUrl = process.env.FRONTEND_URL?.split(",")[0].trim();
-  if (frontendUrl) {
-    try {
-      const destination = new URL(frontendUrl);
-      if (destination.protocol === "http:" || destination.protocol === "https:") {
-        return res.redirect(302, destination.toString());
-      }
-    } catch (err) {
-      console.error("Invalid FRONTEND_URL; serving API information instead.", err.message);
-    }
-  }
   res.json({ ok: true, service: "Wariara Cars Central Rift API", health: "/api/health" });
 });
-app.get("/api-config.js", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "api-config.js"));
-});
-app.use(express.static(__dirname));
-app.use("/public", express.static(path.join(__dirname, "public")));
 
 app.get("/api/config", (req, res) => {
-  const requestOrigin = `${req.protocol}://${req.get("host")}`;
-  const configuredApiBase = process.env.WARIARA_API_BASE || requestOrigin;
-  const normalizedApiBase = /^https?:\/\/localhost(?::|\/)/.test(configuredApiBase) || /^https?:\/\/127\.0\.0\.1(?::|\/)/.test(configuredApiBase)
-    ? configuredApiBase
-    : configuredApiBase.replace(/^http:\/\//, "https://");
   res.json({
-    apiBase: normalizedApiBase,
-    payHeroBase: process.env.PAYHERO_BACKEND_URL || "",
     firebase: {
       apiKey: process.env.FIREBASE_API_KEY,
       authDomain: process.env.FIREBASE_AUTH_DOMAIN,
@@ -76,7 +52,7 @@ const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID;
 const EMAILJS_TEMPLATE_ID = process.env.EMAILJS_TEMPLATE_ID;
 
 if (!ADMIN_SECRET || !process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN) {
-  console.warn("Missing required environment configuration. Check your .env file.");
+  console.warn("Missing required server environment variables: ADMIN_SECRET, TURSO_DATABASE_URL, and/or TURSO_AUTH_TOKEN.");
 }
 
 const db = createClient({

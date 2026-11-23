@@ -1,4 +1,3 @@
-
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -31,9 +30,21 @@ app.get("/api/health", (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  const frontendUrl = process.env.FRONTEND_URL;
-  if (frontendUrl) return res.redirect(302, frontendUrl);
+  const frontendUrl = process.env.FRONTEND_URL?.split(",")[0].trim();
+  if (frontendUrl) {
+    try {
+      const destination = new URL(frontendUrl);
+      if (destination.protocol === "http:" || destination.protocol === "https:") {
+        return res.redirect(302, destination.toString());
+      }
+    } catch (err) {
+      console.error("Invalid FRONTEND_URL; serving API information instead.", err.message);
+    }
+  }
   res.json({ ok: true, service: "Wariara Cars Central Rift API", health: "/api/health" });
+});
+app.get("/api-config.js", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "api-config.js"));
 });
 app.use(express.static(__dirname));
 app.use("/public", express.static(path.join(__dirname, "public")));
@@ -1630,6 +1641,12 @@ app.get("/api/admin/overview", requireAdminKey, async (req, res) => {
     const plans = await db.execute(`SELECT * FROM post_plans ORDER BY price_kes ASC`);
     const priorityPlans = await db.execute(`SELECT * FROM priority_plans ORDER BY duration_hours ASC, price_kes ASC`);
     const catalog = await db.execute(`SELECT * FROM vehicle_catalog ORDER BY brand ASC, model ASC`);
+    const subAccountRows = await db.execute(`SELECT email, two_factor_enabled, updated_at FROM admin_sub_accounts WHERE id = 'primary'`);
+    const subAccount = subAccountRows.rows.length
+      ? serializeRows(subAccountRows.rows)[0]
+      : { email: "", two_factor_enabled: 0, updated_at: null };
+    subAccount.configured = subAccountRows.rows.length > 0;
+
     const sRows = await db.execute(`SELECT * FROM settings`);
     const settings = {};
     for (const r of sRows.rows) settings[r.key] = r.value;
@@ -1649,6 +1666,7 @@ app.get("/api/admin/overview", requireAdminKey, async (req, res) => {
       plans: serializeRows(plans.rows),
       priorityPlans: serializeRows(priorityPlans.rows),
       catalog: serializeRows(catalog.rows),
+      subAccount,
       settings,
     });
   } catch (err) {
@@ -1879,18 +1897,42 @@ app.post("/api/admin/users/:id/appeal", requireAdminKey, async (req, res) => {
   }
 });
 
+app.get("/api/admin/sub-account", requireAdminKey, async (req, res) => {
+  try {
+    const r = await db.execute({ sql: `SELECT email, two_factor_enabled, updated_at FROM admin_sub_accounts WHERE id = 'primary'` });
+    if (r.rows.length === 0) return res.json({ configured: false, email: "", two_factor_enabled: false });
+    const account = serializeRows(r.rows)[0];
+    res.json({ configured: true, email: account.email || "", two_factor_enabled: Boolean(account.two_factor_enabled), updated_at: account.updated_at || null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/api/admin/sub-account", requireAdminKey, async (req, res) => {
   try {
     const { email, password, two_factor_enabled } = req.body;
-    if (!email || !password || password.length < 6) return res.status(400).json({ error: "A valid sub-admin email and password of at least 6 characters are required." });
+    const cleanEmail = String(email || "").trim().toLowerCase();
+    if (!cleanEmail) return res.status(400).json({ error: "Enter a sub-admin email address." });
+
+    const existing = await db.execute({ sql: `SELECT password_hash FROM admin_sub_accounts WHERE id = 'primary'` });
+    let passwordHash;
+    if (password) {
+      if (String(password).length < 6) return res.status(400).json({ error: "Sub-admin password must be at least 6 characters." });
+      passwordHash = hashPassword(String(password));
+    } else if (existing.rows.length > 0) {
+      passwordHash = serializeRows(existing.rows)[0].password_hash;
+    } else {
+      return res.status(400).json({ error: "Set a sub-admin password for the first login." });
+    }
+
     await db.execute({
       sql: `INSERT INTO admin_sub_accounts (id, email, password_hash, two_factor_enabled, updated_at)
             VALUES ('primary', ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(id) DO UPDATE SET email = excluded.email, password_hash = excluded.password_hash,
             two_factor_enabled = excluded.two_factor_enabled, updated_at = CURRENT_TIMESTAMP`,
-      args: [String(email).trim().toLowerCase(), hashPassword(password), two_factor_enabled ? 1 : 0],
+      args: [cleanEmail, passwordHash, two_factor_enabled ? 1 : 0],
     });
-    res.json({ message: "Sub-admin password and email updated." });
+    res.json({ message: "Sub-admin email, password, and security settings updated." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

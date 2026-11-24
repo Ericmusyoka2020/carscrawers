@@ -1,14 +1,10 @@
 
+
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
-import path from "path";
-import { fileURLToPath } from "url";
 import { createClient } from "@libsql/client";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -48,22 +44,14 @@ const db = TURSO_DATABASE_URL
 
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
-app.use(express.static(path.join(__dirname, "public")));
 
-const frontendPages = new Map([
-  ["/", "index.html"],
-  ["/index.html", "index.html"],
-  ["/admin.html", "admin.html"],
-  ["/adminsub.html", "adminsub.html"],
-  ["/faq.html", "faq.html"],
-  ["/market.html", "market.html"],
-  ["/terms.html", "terms.html"],
-  ["/logo.png", "logo.png"],
-]);
-app.get([...frontendPages.keys()], (req, res, next) => {
-  const file = frontendPages.get(req.path);
-  if (!file) return next();
-  res.sendFile(path.join(__dirname, file));
+app.get("/", (req, res) => {
+  res.json({
+    service: "Wariara Cars Central Rift API",
+    message: "Backend API is running. Use the Netlify site for the frontend.",
+    health: "/health",
+    api: "/api",
+  });
 });
 
 app.use("/api", async (req, res, next) => {
@@ -2386,6 +2374,10 @@ app.post("/api/admin/catalog", requireAdmin, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+app.use((req, res) => {
+  res.status(404).json({ error: "API route not found." });
 });
 
 databaseInitialization = initializeDatabaseWithRetry();

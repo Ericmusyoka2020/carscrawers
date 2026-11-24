@@ -1,5 +1,4 @@
 
-
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -13,6 +12,8 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const isVercel = Boolean(process.env.VERCEL);
+let databaseInitialization;
 
 const TURSO_DATABASE_URL = process.env.TURSO_DATABASE_URL;
 const TURSO_AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN;
@@ -33,19 +34,50 @@ const FIREBASE_SIGNING_KEYS_URL = "https://www.googleapis.com/service_accounts/v
 let firebaseSigningKeys = null;
 let firebaseSigningKeysExpiresAt = 0;
 
-if (!TURSO_DATABASE_URL) {
+if (!TURSO_DATABASE_URL && !isVercel) {
   console.error("Missing TURSO_DATABASE_URL environment variable.");
   process.exit(1);
 }
 
-const db = createClient({
-  url: TURSO_DATABASE_URL,
-  authToken: TURSO_AUTH_TOKEN,
-});
+const db = TURSO_DATABASE_URL
+  ? createClient({
+      url: TURSO_DATABASE_URL,
+      authToken: TURSO_AUTH_TOKEN,
+    })
+  : null;
 
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 app.use(express.static(path.join(__dirname, "public")));
+
+const frontendPages = new Map([
+  ["/", "index.html"],
+  ["/index.html", "index.html"],
+  ["/admin.html", "admin.html"],
+  ["/adminsub.html", "adminsub.html"],
+  ["/faq.html", "faq.html"],
+  ["/market.html", "market.html"],
+  ["/terms.html", "terms.html"],
+  ["/logo.png", "logo.png"],
+]);
+app.get([...frontendPages.keys()], (req, res, next) => {
+  const file = frontendPages.get(req.path);
+  if (!file) return next();
+  res.sendFile(path.join(__dirname, file));
+});
+
+app.use("/api", async (req, res, next) => {
+  try {
+    if (!databaseInitialization) {
+      throw new Error("Database initialization has not started.");
+    }
+    await databaseInitialization;
+    next();
+  } catch (error) {
+    console.error("Database initialization failed:", error);
+    res.status(503).json({ error: "Database service is temporarily unavailable." });
+  }
+});
 
 app.get("/api/config", (req, res) => {
   res.json({ firebase: FIREBASE_CONFIG });
@@ -97,6 +129,10 @@ async function initDb() {
         appeal_status TEXT,
         terms_accepted_at TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS seller_phone_numbers (
+        phone_number TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL
       )`,
       `CREATE TABLE IF NOT EXISTS password_reset_tokens (
         id TEXT PRIMARY KEY,
@@ -216,6 +252,24 @@ async function initDb() {
     ],
     "write"
   );
+
+  const usersRes = await db.execute("SELECT id, whatsapp_phone, call_phone FROM users");
+  const phoneRegistryMigrations = [];
+  for (const user of rowsToArray(usersRes)) {
+    const phoneNumbers = [...new Set([
+      normalizePhoneNumber(user.whatsapp_phone),
+      normalizePhoneNumber(user.call_phone),
+    ].filter(Boolean))];
+    for (const phoneNumber of phoneNumbers) {
+      phoneRegistryMigrations.push({
+        sql: "INSERT OR IGNORE INTO seller_phone_numbers (phone_number, user_id) VALUES (?, ?)",
+        args: [phoneNumber, user.id],
+      });
+    }
+  }
+  if (phoneRegistryMigrations.length) {
+    await db.batch(phoneRegistryMigrations, "write");
+  }
 
   const listingColumns = await db.execute("PRAGMA table_info(listings)");
   const existingListingColumns = new Set(listingColumns.rows.map((row) => row.name));
@@ -415,6 +469,9 @@ function isTransientDatabaseError(error) {
 }
 
 async function initializeDatabaseWithRetry() {
+  if (!db) {
+    throw new Error("Missing TURSO_DATABASE_URL environment variable.");
+  }
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -746,6 +803,39 @@ function sanitizeUser(u) {
   return copy;
 }
 
+function normalizePhoneNumber(value) {
+  let digits = String(value || "").replace(/\D/g, "");
+  if (digits.startsWith("00")) digits = digits.slice(2);
+  if (digits.startsWith("0")) digits = `254${digits.slice(1)}`;
+  else if (digits.length === 9 && /^[17]/.test(digits)) digits = `254${digits}`;
+  if (digits.length < 10 || digits.length > 15) return "";
+  return `+${digits}`;
+}
+
+function phoneNumberError(numbers) {
+  if (numbers.some((number) => !number)) {
+    return "Enter valid phone numbers, including the country code for numbers outside Kenya.";
+  }
+  return null;
+}
+
+async function checkPhoneNumberConflict(phoneNumbers, exceptUserId = null) {
+  const uniqueNumbers = [...new Set(phoneNumbers)];
+  const placeholders = uniqueNumbers.map(() => "?").join(", ");
+  const result = await db.execute({
+    sql: `SELECT phone_number FROM seller_phone_numbers
+      WHERE phone_number IN (${placeholders}) AND (? IS NULL OR user_id != ?)`,
+    args: [...uniqueNumbers, exceptUserId, exceptUserId],
+  });
+  return result.rows.length > 0;
+}
+
+function phoneNumberConflictResponse(res) {
+  return res.status(409).json({
+    error: "This mobile or WhatsApp number is already registered to another account. Use a different number.",
+  });
+}
+
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -833,6 +923,12 @@ app.post("/api/sellers/account", async (req, res) => {
     if (accepted_terms !== true && accepted_terms !== "true") {
       return res.status(400).json({ error: "You must accept the Terms and Conditions to create an account." });
     }
+    const phoneNumbers = [
+      normalizePhoneNumber(whatsapp_phone),
+      normalizePhoneNumber(call_phone),
+    ];
+    const invalidPhone = phoneNumberError(phoneNumbers);
+    if (invalidPhone) return res.status(400).json({ error: invalidPhone });
 
     const firebaseUser = await verifyFirebaseIdToken(firebase_id_token);
     const cleanEmail = firebaseUser.email.trim().toLowerCase();
@@ -845,6 +941,7 @@ app.post("/api/sellers/account", async (req, res) => {
     });
     const existingUser = rowToObj(existingRes);
     if (existingUser) return res.json({ user: sanitizeUser(existingUser) });
+    if (await checkPhoneNumberConflict(phoneNumbers)) return phoneNumberConflictResponse(res);
 
     const id = crypto.randomUUID();
     const cleanRole = role === "dealer" ? "dealer" : "private";
@@ -852,25 +949,37 @@ app.post("/api/sellers/account", async (req, res) => {
     const shopSlug = slugify(name);
     const nowIso = new Date().toISOString();
 
-    await db.execute({
-      sql: `INSERT INTO users
-        (id, name, email, password_hash, whatsapp_phone, call_phone, role, town, shop_slug,
-         free_posts_used, paid_post_credits, total_purchased_posts, total_spent_kes, is_suspended, terms_accepted_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?)`,
-      args: [
-        id,
-        String(name).trim(),
-        cleanEmail,
-        hashPassword(crypto.randomBytes(32).toString("hex")),
-        String(whatsapp_phone).trim(),
-        String(call_phone).trim(),
-        cleanRole,
-        cleanTown,
-        shopSlug,
-        nowIso,
-        nowIso,
-      ],
-    });
+    const uniquePhoneNumbers = [...new Set(phoneNumbers)];
+    try {
+      await db.batch([
+        {
+          sql: `INSERT INTO users
+            (id, name, email, password_hash, whatsapp_phone, call_phone, role, town, shop_slug,
+             free_posts_used, paid_post_credits, total_purchased_posts, total_spent_kes, is_suspended, terms_accepted_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?)`,
+          args: [
+            id,
+            String(name).trim(),
+            cleanEmail,
+            hashPassword(crypto.randomBytes(32).toString("hex")),
+            phoneNumbers[0],
+            phoneNumbers[1],
+            cleanRole,
+            cleanTown,
+            shopSlug,
+            nowIso,
+            nowIso,
+          ],
+        },
+        ...uniquePhoneNumbers.map((phoneNumber) => ({
+          sql: "INSERT INTO seller_phone_numbers (phone_number, user_id) VALUES (?, ?)",
+          args: [phoneNumber, id],
+        })),
+      ], "write");
+    } catch (error) {
+      if (await checkPhoneNumberConflict(phoneNumbers)) return phoneNumberConflictResponse(res);
+      throw error;
+    }
 
     const createdRes = await db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [id] });
     res.json({ user: sanitizeUser(rowToObj(createdRes)) });
@@ -2025,48 +2134,79 @@ app.post("/api/admin/dealers", requireAdmin, async (req, res) => {
     if (!name || !email || !whatsapp_phone || !call_phone) {
       return res.status(400).json({ error: "Name, email, WhatsApp, and call phone are required to add a dealer." });
     }
+    const phoneNumbers = [
+      normalizePhoneNumber(whatsapp_phone),
+      normalizePhoneNumber(call_phone),
+    ];
+    const invalidPhone = phoneNumberError(phoneNumbers);
+    if (invalidPhone) return res.status(400).json({ error: invalidPhone });
 
     const cleanEmail = String(email).trim().toLowerCase();
     const existingRes = await db.execute({ sql: "SELECT * FROM users WHERE email = ?", args: [cleanEmail] });
     const existing = rowToObj(existingRes);
 
     if (existing) {
-      await db.execute({
-        sql: "UPDATE users SET name = ?, whatsapp_phone = ?, call_phone = ?, town = ?, role = 'dealer', shop_slug = ? WHERE id = ?",
-        args: [
-          String(name).trim(),
-          String(whatsapp_phone).trim(),
-          String(call_phone).trim(),
-          String(town).trim() || "Nakuru",
-          existing.shop_slug || slugify(name),
-          existing.id,
-        ],
-      });
+      if (await checkPhoneNumberConflict(phoneNumbers, existing.id)) return phoneNumberConflictResponse(res);
+      try {
+        await db.batch([
+          {
+            sql: "UPDATE users SET name = ?, whatsapp_phone = ?, call_phone = ?, town = ?, role = 'dealer', shop_slug = ? WHERE id = ?",
+            args: [
+              String(name).trim(),
+              phoneNumbers[0],
+              phoneNumbers[1],
+              String(town).trim() || "Nakuru",
+              existing.shop_slug || slugify(name),
+              existing.id,
+            ],
+          },
+          { sql: "DELETE FROM seller_phone_numbers WHERE user_id = ?", args: [existing.id] },
+          ...[...new Set(phoneNumbers)].map((phoneNumber) => ({
+            sql: "INSERT INTO seller_phone_numbers (phone_number, user_id) VALUES (?, ?)",
+            args: [phoneNumber, existing.id],
+          })),
+        ], "write");
+      } catch (error) {
+        if (await checkPhoneNumberConflict(phoneNumbers, existing.id)) return phoneNumberConflictResponse(res);
+        throw error;
+      }
       return res.json({ message: `Updated ${String(name).trim()} as a Dealer.` });
     }
+    if (await checkPhoneNumberConflict(phoneNumbers)) return phoneNumberConflictResponse(res);
 
     const id = crypto.randomUUID();
     const tempPass = crypto.randomBytes(12).toString("hex");
     const nowIso = new Date().toISOString();
 
-    await db.execute({
-      sql: `INSERT INTO users
-        (id, name, email, password_hash, whatsapp_phone, call_phone, role, town, shop_slug,
-         free_posts_used, paid_post_credits, total_purchased_posts, total_spent_kes, is_suspended, terms_accepted_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'dealer', ?, ?, 0, 0, 0, 0, 0, ?, ?)`,
-      args: [
-        id,
-        String(name).trim(),
-        cleanEmail,
-        hashPassword(tempPass),
-        String(whatsapp_phone).trim(),
-        String(call_phone).trim(),
-        String(town).trim() || "Nakuru",
-        slugify(name),
-        nowIso,
-        nowIso,
-      ],
-    });
+    try {
+      await db.batch([
+        {
+          sql: `INSERT INTO users
+            (id, name, email, password_hash, whatsapp_phone, call_phone, role, town, shop_slug,
+             free_posts_used, paid_post_credits, total_purchased_posts, total_spent_kes, is_suspended, terms_accepted_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'dealer', ?, ?, 0, 0, 0, 0, 0, ?, ?)`,
+          args: [
+            id,
+            String(name).trim(),
+            cleanEmail,
+            hashPassword(tempPass),
+            phoneNumbers[0],
+            phoneNumbers[1],
+            String(town).trim() || "Nakuru",
+            slugify(name),
+            nowIso,
+            nowIso,
+          ],
+        },
+        ...[...new Set(phoneNumbers)].map((phoneNumber) => ({
+          sql: "INSERT INTO seller_phone_numbers (phone_number, user_id) VALUES (?, ?)",
+          args: [phoneNumber, id],
+        })),
+      ], "write");
+    } catch (error) {
+      if (await checkPhoneNumberConflict(phoneNumbers)) return phoneNumberConflictResponse(res);
+      throw error;
+    }
 
     res.json({ message: `Added dealer "${String(name).trim()}".` });
   } catch (err) {
@@ -2248,13 +2388,23 @@ app.post("/api/admin/catalog", requireAdmin, async (req, res) => {
   }
 });
 
-initializeDatabaseWithRetry()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`Wariara Cars Central Rift API (Turso) running on port ${PORT}`);
-    });
-  })
-  .catch((err) => {
-    console.error("Failed to initialize Turso database:", err);
-    process.exit(1);
+databaseInitialization = initializeDatabaseWithRetry();
+
+if (isVercel) {
+  databaseInitialization.catch((error) => {
+    console.error("Failed to initialize Turso database:", error);
   });
+} else {
+  databaseInitialization
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`Wariara Cars Central Rift API (Turso) running on port ${PORT}`);
+      });
+    })
+    .catch((error) => {
+      console.error("Failed to initialize Turso database:", error);
+      process.exit(1);
+    });
+}
+
+export default app;

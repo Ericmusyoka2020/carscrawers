@@ -83,6 +83,7 @@ async function initDb() {
         name TEXT NOT NULL,
         email TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL,
+        phone TEXT,
         whatsapp_phone TEXT NOT NULL,
         call_phone TEXT NOT NULL,
         role TEXT DEFAULT 'private',
@@ -221,6 +222,7 @@ async function initDb() {
   const userColumns = await db.execute("PRAGMA table_info(users)");
   const existingUserColumns = new Set(userColumns.rows.map((row) => row.name));
   const userColumnMigrations = [
+    ["phone", "TEXT"],
     ["role", "TEXT DEFAULT 'private'"],
     ["town", "TEXT DEFAULT 'Nakuru'"],
     ["shop_slug", "TEXT"],
@@ -240,6 +242,11 @@ async function initDb() {
       await db.execute(`ALTER TABLE users ADD COLUMN ${column} ${definition}`);
     }
   }
+  await db.execute(`
+    UPDATE users
+    SET phone = COALESCE(NULLIF(phone, ''), NULLIF(whatsapp_phone, ''), call_phone)
+    WHERE phone IS NULL OR phone = ''
+  `);
 
   const listingColumns = await db.execute("PRAGMA table_info(listings)");
   const existingListingColumns = new Set(listingColumns.rows.map((row) => row.name));
@@ -878,14 +885,15 @@ app.post("/api/sellers/account", async (req, res) => {
 
     await db.execute({
       sql: `INSERT INTO users
-        (id, name, email, password_hash, whatsapp_phone, call_phone, role, town, shop_slug,
+        (id, name, email, password_hash, phone, whatsapp_phone, call_phone, role, town, shop_slug,
          free_posts_used, paid_post_credits, total_purchased_posts, total_spent_kes, is_suspended, terms_accepted_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?)`,
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?)`,
       args: [
         id,
         String(name).trim(),
         cleanEmail,
         hashPassword(crypto.randomBytes(32).toString("hex")),
+        String(whatsapp_phone).trim(),
         String(whatsapp_phone).trim(),
         String(call_phone).trim(),
         cleanRole,
@@ -2056,9 +2064,10 @@ app.post("/api/admin/dealers", requireAdmin, async (req, res) => {
 
     if (existing) {
       await db.execute({
-        sql: "UPDATE users SET name = ?, whatsapp_phone = ?, call_phone = ?, town = ?, role = 'dealer', shop_slug = ? WHERE id = ?",
+        sql: "UPDATE users SET name = ?, phone = ?, whatsapp_phone = ?, call_phone = ?, town = ?, role = 'dealer', shop_slug = ? WHERE id = ?",
         args: [
           String(name).trim(),
+          String(whatsapp_phone).trim(),
           String(whatsapp_phone).trim(),
           String(call_phone).trim(),
           String(town).trim() || "Nakuru",
@@ -2075,14 +2084,15 @@ app.post("/api/admin/dealers", requireAdmin, async (req, res) => {
 
     await db.execute({
       sql: `INSERT INTO users
-        (id, name, email, password_hash, whatsapp_phone, call_phone, role, town, shop_slug,
+        (id, name, email, password_hash, phone, whatsapp_phone, call_phone, role, town, shop_slug,
          free_posts_used, paid_post_credits, total_purchased_posts, total_spent_kes, is_suspended, terms_accepted_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'dealer', ?, ?, 0, 0, 0, 0, 0, ?, ?)`,
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'dealer', ?, ?, 0, 0, 0, 0, 0, ?, ?)`,
       args: [
         id,
         String(name).trim(),
         cleanEmail,
         hashPassword(tempPass),
+        String(whatsapp_phone).trim(),
         String(whatsapp_phone).trim(),
         String(call_phone).trim(),
         String(town).trim() || "Nakuru",

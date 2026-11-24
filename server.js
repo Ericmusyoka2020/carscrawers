@@ -218,6 +218,29 @@ async function initDb() {
     "write"
   );
 
+  const userColumns = await db.execute("PRAGMA table_info(users)");
+  const existingUserColumns = new Set(userColumns.rows.map((row) => row.name));
+  const userColumnMigrations = [
+    ["role", "TEXT DEFAULT 'private'"],
+    ["town", "TEXT DEFAULT 'Nakuru'"],
+    ["shop_slug", "TEXT"],
+    ["free_posts_used", "INTEGER DEFAULT 0"],
+    ["paid_post_credits", "INTEGER DEFAULT 0"],
+    ["total_purchased_posts", "INTEGER DEFAULT 0"],
+    ["total_spent_kes", "INTEGER DEFAULT 0"],
+    ["is_suspended", "INTEGER DEFAULT 0"],
+    ["suspension_reason", "TEXT"],
+    ["appeal_text", "TEXT"],
+    ["appeal_status", "TEXT"],
+    ["terms_accepted_at", "TEXT"],
+    ["created_at", "TEXT"],
+  ];
+  for (const [column, definition] of userColumnMigrations) {
+    if (!existingUserColumns.has(column)) {
+      await db.execute(`ALTER TABLE users ADD COLUMN ${column} ${definition}`);
+    }
+  }
+
   const listingColumns = await db.execute("PRAGMA table_info(listings)");
   const existingListingColumns = new Set(listingColumns.rows.map((row) => row.name));
   const listingColumnMigrations = [

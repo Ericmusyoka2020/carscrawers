@@ -10,6 +10,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const isVercel = Boolean(process.env.VERCEL);
 let databaseInitialization;
+let databaseInitializationError = null;
+let databaseInitialized = false;
 
 const TURSO_DATABASE_URL = process.env.TURSO_DATABASE_URL;
 const TURSO_AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN;
@@ -63,7 +65,11 @@ app.use("/api", async (req, res, next) => {
     next();
   } catch (error) {
     console.error("Database initialization failed:", error);
-    res.status(503).json({ error: "Database service is temporarily unavailable." });
+    res.status(503).json({
+      error: !TURSO_DATABASE_URL
+        ? "Database is not configured. Add TURSO_DATABASE_URL to the Vercel project environment variables, then redeploy."
+        : "Could not connect to or initialize the database. Verify TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in Vercel, then check the deployment logs.",
+    });
   }
 });
 
@@ -825,9 +831,20 @@ function phoneNumberConflictResponse(res) {
 }
 
 app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
+  const configured = Boolean(TURSO_DATABASE_URL);
+  const initialized = databaseInitialized;
+  res.status(initialized ? 200 : 503).json({
+    ok: initialized,
     service: "Wariara Cars Central Rift API (Turso)",
+    database: {
+      configured,
+      initialized,
+      message: !configured
+        ? "Set TURSO_DATABASE_URL in Vercel Environment Variables and redeploy."
+        : databaseInitializationError
+          ? "Database initialization failed. Check TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, and deployment logs."
+          : "Database is ready.",
+    },
     emailjsConfigured: Boolean(
       EMAILJS_PUBLIC_KEY && EMAILJS_PRIVATE_KEY && EMAILJS_SERVICE_ID && EMAILJS_TEMPLATE_ID
     ),
@@ -2381,6 +2398,15 @@ app.use((req, res) => {
 });
 
 databaseInitialization = initializeDatabaseWithRetry();
+databaseInitialization = databaseInitialization.then(
+  () => {
+    databaseInitialized = true;
+  },
+  (error) => {
+    databaseInitializationError = error;
+    throw error;
+  },
+);
 
 if (isVercel) {
   databaseInitialization.catch((error) => {

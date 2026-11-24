@@ -988,6 +988,23 @@ app.get("/api/sellers/lookup", async (req, res) => {
   }
 });
 
+async function getActiveSeller(sellerId, res) {
+  const userRes = await db.execute({
+    sql: "SELECT * FROM users WHERE id = ?",
+    args: [sellerId],
+  });
+  const user = rowToObj(userRes);
+  if (!user) {
+    res.status(404).json({ error: "Seller account not found." });
+    return null;
+  }
+  if (Number(user.is_suspended)) {
+    res.status(403).json({ error: "Your seller account is suspended. You can only request a review." });
+    return null;
+  }
+  return user;
+}
+
 app.get("/api/sellers/:id/notifications", async (req, res) => {
   try {
     const [notifRes, paymentsRes] = await Promise.all([
@@ -1030,12 +1047,25 @@ app.get("/api/sellers/:id/listings", async (req, res) => {
 app.post("/api/sellers/:id/appeal", async (req, res) => {
   try {
     const { appeal_text } = req.body;
-    if (!appeal_text || !String(appeal_text).trim()) {
+    const message = String(appeal_text || "").trim();
+    if (!message) {
       return res.status(400).json({ error: "Please enter a review message." });
+    }
+    if (message.length > 2000) {
+      return res.status(400).json({ error: "Review message must be 2,000 characters or fewer." });
+    }
+    const userRes = await db.execute({
+      sql: "SELECT id, is_suspended FROM users WHERE id = ?",
+      args: [req.params.id],
+    });
+    const user = rowToObj(userRes);
+    if (!user) return res.status(404).json({ error: "Seller account not found." });
+    if (!Number(user.is_suspended)) {
+      return res.status(409).json({ error: "A review request is only available while your account is suspended." });
     }
     await db.execute({
       sql: "UPDATE users SET appeal_text = ?, appeal_status = 'pending' WHERE id = ?",
-      args: [String(appeal_text).trim(), req.params.id],
+      args: [message, req.params.id],
     });
     res.json({ message: "Review request sent to Admin." });
   } catch (err) {
@@ -1061,6 +1091,9 @@ app.post("/api/plans/purchase", async (req, res) => {
 
     if (!user || !plan) {
       return res.status(404).json({ error: "Seller or plan not found." });
+    }
+    if (Number(user.is_suspended)) {
+      return res.status(403).json({ error: "Your seller account is suspended. You can only request a review." });
     }
 
     const newCredits = Number(user.paid_post_credits || 0) + Number(plan.post_count || 0);
@@ -1408,6 +1441,11 @@ app.put("/api/listings/:id", async (req, res) => {
     const existingRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] });
     const existing = rowToObj(existingRes);
     if (!existing) return res.status(404).json({ error: "Listing not found." });
+    if (!payload.seller_id || existing.seller_id !== payload.seller_id) {
+      return res.status(403).json({ error: "You can only edit your own post." });
+    }
+    const user = await getActiveSeller(existing.seller_id, res);
+    if (!user) return;
 
     await db.execute({
       sql: `UPDATE listings SET
@@ -1477,6 +1515,8 @@ app.patch("/api/listings/:id/status", async (req, res) => {
     if (!seller_id || listing.seller_id !== seller_id) {
       return res.status(403).json({ error: "You can only change the status of your own post." });
     }
+    const user = await getActiveSeller(seller_id, res);
+    if (!user) return;
     const update = await db.execute({
       sql: "UPDATE listings SET status = ?, updated_at = ? WHERE id = ? AND seller_id = ?",
       args: [status, new Date().toISOString(), req.params.id, seller_id],
@@ -1539,6 +1579,11 @@ app.post("/api/listings/:id/prioritize", async (req, res) => {
 
     const listing = rowToObj(listRes);
     if (!listing) return res.status(404).json({ error: "Listing not found." });
+    if (!req.body?.seller_id || listing.seller_id !== req.body.seller_id) {
+      return res.status(403).json({ error: "You can only prioritize your own post." });
+    }
+    const user = await getActiveSeller(listing.seller_id, res);
+    if (!user) return;
 
     const settings = {};
     for (const r of rowsToArray(settingsRes)) settings[r.key] = r.value;
@@ -1572,6 +1617,7 @@ app.post("/api/listings/:id/prioritize", async (req, res) => {
       sellerId: listing.seller_id,
       payerName: listing.seller_name,
       payerPhone: payer_phone || listing.whatsapp_phone,
+      payerEmail: user.email,
       purpose: `24h Post Priority: ${listing.title}`,
       amountKes: amount,
       paymentRef,

@@ -32,21 +32,51 @@ const db = TURSO_DATABASE_URL
   ? createClient({ url: TURSO_DATABASE_URL, authToken: TURSO_AUTH_TOKEN })
   : null;
 let databaseInitialization;
+let databaseInitializationError = null;
 
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 app.use("/api", async (req, res, next) => {
   if (req.path === "/config") return next();
   if (!db) return res.status(503).json({ error: "Database unavailable: TURSO_DATABASE_URL is not configured." });
+  if (isRemoteTursoUrl() && !TURSO_AUTH_TOKEN) {
+    return res.status(503).json({ error: "Database unavailable: TURSO_AUTH_TOKEN is not configured for the remote Turso database." });
+  }
   try {
     const ready = await databaseInitialization;
-    if (!ready) return res.status(503).json({ error: "Database unavailable. Check the Turso connection and configuration." });
+    if (!ready) {
+      return res.status(503).json({
+        error: "Database initialization failed.",
+        database: getDatabaseDiagnostics(),
+      });
+    }
     return next();
   } catch (error) {
     console.error("Database initialization failed:", error);
-    return res.status(503).json({ error: "Database unavailable. Check the Turso connection and configuration." });
+    return res.status(503).json({
+      error: "Database initialization failed.",
+      database: getDatabaseDiagnostics(),
+    });
   }
 });
+
+function getDatabaseDiagnostics() {
+  return {
+    urlConfigured: Boolean(TURSO_DATABASE_URL),
+    authTokenConfigured: Boolean(TURSO_AUTH_TOKEN),
+    configurationError: !TURSO_DATABASE_URL
+      ? "TURSO_DATABASE_URL is not configured."
+      : isRemoteTursoUrl() && !TURSO_AUTH_TOKEN
+        ? "TURSO_AUTH_TOKEN is not configured for the remote Turso database."
+        : null,
+    failureType: databaseInitializationError?.name || null,
+    failureCode: databaseInitializationError?.code || databaseInitializationError?.cause?.code || null,
+  };
+}
+
+function isRemoteTursoUrl() {
+  return Boolean(TURSO_DATABASE_URL && !/^(file:|:memory:)/i.test(TURSO_DATABASE_URL));
+}
 
 app.get("/api/config", (req, res) => {
   res.json({ firebase: FIREBASE_CONFIG });
@@ -821,6 +851,10 @@ app.get("/health", async (req, res) => {
     ok: Boolean(databaseReady),
     service: "Wariara Cars Central Rift API (Turso)",
     databaseConfigured: Boolean(TURSO_DATABASE_URL),
+    database: {
+      ...getDatabaseDiagnostics(),
+      ready: Boolean(databaseReady),
+    },
     emailjsConfigured: Boolean(
       EMAILJS_PUBLIC_KEY && EMAILJS_PRIVATE_KEY && EMAILJS_SERVICE_ID && EMAILJS_TEMPLATE_ID
     ),
@@ -2394,11 +2428,13 @@ app.post("/api/admin/catalog", requireAdmin, async (req, res) => {
 const isVercel = Boolean(process.env.VERCEL);
 if (!TURSO_DATABASE_URL) {
   console.error("Missing TURSO_DATABASE_URL environment variable.");
+  databaseInitializationError = new Error("Missing TURSO_DATABASE_URL environment variable.");
   databaseInitialization = Promise.resolve(false);
 } else {
   databaseInitialization = initializeDatabaseWithRetry()
     .then(() => true)
     .catch((err) => {
+      databaseInitializationError = err;
       console.error("Failed to initialize Turso database:", err);
       return false;
     });

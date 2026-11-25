@@ -1,5 +1,6 @@
 
 
+
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -172,7 +173,15 @@ async function initDb() {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         post_count INTEGER NOT NULL,
-        price_kes INTEGER NOT NULL
+        price_kes INTEGER NOT NULL,
+        duration_days INTEGER NOT NULL DEFAULT 70
+      )`,
+      `CREATE TABLE IF NOT EXISTS seller_post_credit_lots (
+        id TEXT PRIMARY KEY,
+        seller_id TEXT NOT NULL,
+        remaining_posts INTEGER NOT NULL,
+        duration_days INTEGER NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
       )`,
       `CREATE TABLE IF NOT EXISTS priority_plans (
         id TEXT PRIMARY KEY,
@@ -220,6 +229,8 @@ async function initDb() {
           CHECK (status IN ('pending_approval', 'active', 'paused', 'reported_suspended', 'unsafe_removed', 'sold', 'rejected', 'expired')),
         rejection_reason TEXT,
         is_paid_post INTEGER DEFAULT 0,
+        expiry_days INTEGER NOT NULL DEFAULT 14,
+        expired_at TEXT,
         published_at TEXT,
         priority_amount_kes INTEGER DEFAULT 0,
         priority_date TEXT,
@@ -304,6 +315,12 @@ async function initDb() {
     SET phone = COALESCE(NULLIF(phone, ''), NULLIF(whatsapp_phone, ''), call_phone)
     WHERE phone IS NULL OR phone = ''
   `);
+  const postPlanColumns = await db.execute("PRAGMA table_info(post_plans)");
+  const existingPostPlanColumns = new Set(postPlanColumns.rows.map((row) => row.name));
+  if (!existingPostPlanColumns.has("duration_days")) {
+    await db.execute("ALTER TABLE post_plans ADD COLUMN duration_days INTEGER NOT NULL DEFAULT 70");
+  }
+  await db.execute("UPDATE post_plans SET duration_days = 70 WHERE duration_days IS NULL OR duration_days < 1");
 
   const listingColumns = await db.execute("PRAGMA table_info(listings)");
   const existingListingColumns = new Set(listingColumns.rows.map((row) => row.name));
@@ -312,12 +329,21 @@ async function initDb() {
     ["seller_slug", "TEXT"],
     ["updated_at", "TEXT"],
     ["rejection_reason", "TEXT"],
+    ["expiry_days", "INTEGER NOT NULL DEFAULT 14"],
+    ["expired_at", "TEXT"],
   ];
   for (const [column, definition] of listingColumnMigrations) {
     if (!existingListingColumns.has(column)) {
       await db.execute(`ALTER TABLE listings ADD COLUMN ${column} ${definition}`);
     }
   }
+  if (!existingListingColumns.has("expiry_days")) {
+    await db.execute("UPDATE listings SET expiry_days = CASE WHEN is_paid_post = 1 THEN 70 ELSE 14 END");
+  }
+  await db.execute(`
+    UPDATE listings SET expired_at = COALESCE(expired_at, updated_at, created_at)
+    WHERE status = 'expired' AND expired_at IS NULL
+  `);
   const listingsSchemaRes = await db.execute(
     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'listings'"
   );
@@ -366,6 +392,8 @@ async function initDb() {
             CHECK (status IN ('pending_approval', 'active', 'paused', 'reported_suspended', 'unsafe_removed', 'sold', 'rejected', 'expired')),
           rejection_reason TEXT,
           is_paid_post INTEGER DEFAULT 0,
+          expiry_days INTEGER NOT NULL DEFAULT 14,
+          expired_at TEXT,
           published_at TEXT,
           priority_amount_kes INTEGER DEFAULT 0,
           priority_date TEXT,
@@ -379,7 +407,7 @@ async function initDb() {
           transmission, drive_type, air_con, engine_cc, mileage_km, part_name, part_make,
           part_model, year_from, year_to, part_condition, part_authenticity, price_kes, negotiable,
           town, description, status, rejection_reason, is_paid_post, published_at,
-          priority_amount_kes, priority_date, report_reason, created_at, updated_at
+          expiry_days, expired_at, priority_amount_kes, priority_date, report_reason, created_at, updated_at
         )
         SELECT
           id, seller_id, seller_name, seller_slug, whatsapp_phone, call_phone, category, title,
@@ -387,7 +415,7 @@ async function initDb() {
           transmission, drive_type, air_con, engine_cc, mileage_km, part_name, part_make,
           part_model, year_from, year_to, part_condition, part_authenticity, price_kes, negotiable,
           town, description, status, rejection_reason, is_paid_post, published_at,
-          priority_amount_kes, priority_date, report_reason, created_at, updated_at
+          expiry_days, expired_at, priority_amount_kes, priority_date, report_reason, created_at, updated_at
         FROM listings`,
         "DROP TABLE listings",
         "ALTER TABLE listings_migrated RENAME TO listings",
@@ -468,12 +496,12 @@ async function initDb() {
     await db.batch(
       [
         {
-          sql: "INSERT INTO post_plans (id, name, post_count, price_kes) VALUES (?, ?, ?, ?)",
-          args: ["plan-starter", "Starter Pack", 10, 200],
+          sql: "INSERT INTO post_plans (id, name, post_count, price_kes, duration_days) VALUES (?, ?, ?, ?, ?)",
+          args: ["plan-starter", "Starter Pack", 10, 200, 70],
         },
         {
-          sql: "INSERT INTO post_plans (id, name, post_count, price_kes) VALUES (?, ?, ?, ?)",
-          args: ["plan-pro", "Dealer Pack", 25, 500],
+          sql: "INSERT INTO post_plans (id, name, post_count, price_kes, duration_days) VALUES (?, ?, ?, ?, ?)",
+          args: ["plan-pro", "Dealer Pack", 25, 500, 70],
         },
       ],
       "write"
@@ -748,32 +776,87 @@ function todayKenyaDate() {
 }
 
 function computeDaysRemaining(listing) {
-  if (!Number(listing.is_paid_post)) return null;
-  const baseDate = listing.published_at || listing.created_at;
-  if (!baseDate) return 70;
+  const durationDays = Math.max(1, Number(listing.expiry_days || (Number(listing.is_paid_post) ? 70 : 14)));
+  const baseDate = listing.published_at ||
+    (listing.status === "pending_approval" ? null : listing.created_at);
+  if (!baseDate) return durationDays;
   const elapsedMs = Date.now() - new Date(baseDate).getTime();
+  if (!Number.isFinite(elapsedMs)) return durationDays;
   const elapsedDays = Math.floor(elapsedMs / (1000 * 60 * 60 * 24));
-  return Math.max(0, 70 - elapsedDays);
+  return Math.max(0, durationDays - elapsedDays);
 }
 
 async function syncExpiredListings() {
   const res = await db.execute(
-    "SELECT id, created_at, published_at, is_paid_post, status FROM listings WHERE is_paid_post = 1 AND status = 'active'"
+    "SELECT id, created_at, published_at, is_paid_post, expiry_days, expired_at, status FROM listings WHERE status IN ('active', 'paused')"
   );
-  const paidActive = rowsToArray(res);
-  if (paidActive.length === 0) return;
-
-  const expiredIds = paidActive
+  const dueIds = rowsToArray(res)
     .filter((l) => computeDaysRemaining(l) === 0)
     .map((l) => l.id);
 
   const nowIso = new Date().toISOString();
-  for (const id of expiredIds) {
+  for (const id of dueIds) {
     await db.execute({
-      sql: "UPDATE listings SET status = 'expired', updated_at = ? WHERE id = ?",
-      args: [nowIso, id],
+      sql: "UPDATE listings SET status = 'expired', expired_at = ?, updated_at = ? WHERE id = ? AND status IN ('active', 'paused')",
+      args: [nowIso, nowIso, id],
     });
   }
+
+  const expiredRes = await db.execute({
+    sql: "SELECT id FROM listings WHERE status = 'expired' AND expired_at <= ? ORDER BY expired_at ASC LIMIT 250",
+    args: argsForExpiryCutoff(nowIso),
+  });
+  const purgeIds = rowsToArray(expiredRes).map((listing) => listing.id);
+  if (purgeIds.length > 0) {
+    const placeholders = purgeIds.map(() => "?").join(",");
+    await db.batch([
+      { sql: `DELETE FROM listing_photos WHERE listing_id IN (${placeholders})`, args: purgeIds },
+      { sql: `DELETE FROM listings WHERE id IN (${placeholders})`, args: purgeIds },
+    ], "write");
+  }
+}
+
+function argsForExpiryCutoff(nowIso) {
+  return [new Date(new Date(nowIso).getTime() - 14 * 24 * 60 * 60 * 1000).toISOString()];
+}
+
+function canRepostExpiredListing(listing) {
+  if (listing.status !== "expired" || !listing.expired_at) return false;
+  const expiredAt = new Date(listing.expired_at).getTime();
+  return Number.isFinite(expiredAt) && Date.now() - expiredAt <= 14 * 24 * 60 * 60 * 1000;
+}
+
+async function consumePaidPostCredit(sellerId, paidCredits) {
+  if (Number(paidCredits) < 1) return null;
+  const lotRes = await db.execute({
+    sql: "SELECT * FROM seller_post_credit_lots WHERE seller_id = ? AND remaining_posts > 0 ORDER BY created_at ASC LIMIT 1",
+    args: [sellerId],
+  });
+  const lot = rowToObj(lotRes);
+  if (lot) {
+    const updatedLot = await db.execute({
+      sql: "UPDATE seller_post_credit_lots SET remaining_posts = remaining_posts - 1 WHERE id = ? AND remaining_posts > 0",
+      args: [lot.id],
+    });
+    if (!Number(updatedLot.rowsAffected)) return null;
+    await db.execute({
+      sql: "UPDATE users SET paid_post_credits = paid_post_credits - 1 WHERE id = ? AND paid_post_credits > 0",
+      args: [sellerId],
+    });
+    return Math.max(1, Number(lot.duration_days || 70));
+  }
+
+  const lotCountRes = await db.execute({
+    sql: "SELECT COALESCE(SUM(remaining_posts), 0) AS count FROM seller_post_credit_lots WHERE seller_id = ?",
+    args: [sellerId],
+  });
+  const lotCreditCount = Number(lotCountRes.rows[0]?.[0] || 0);
+  if (Number(paidCredits) <= lotCreditCount) return null;
+  const updatedUser = await db.execute({
+    sql: "UPDATE users SET paid_post_credits = paid_post_credits - 1 WHERE id = ? AND paid_post_credits > ?",
+    args: [sellerId, lotCreditCount],
+  });
+  return Number(updatedUser.rowsAffected) ? 70 : null;
 }
 
 async function addSellerNotification(sellerId, message) {
@@ -1148,6 +1231,7 @@ app.get("/api/sellers/:id/listings", async (req, res) => {
     const enriched = rowsToArray(listRes).map((l) => ({
       ...l,
       days_remaining: computeDaysRemaining(l),
+      can_repost: canRepostExpiredListing(l),
     }));
     res.json({ listings: enriched });
   } catch (err) {
@@ -1211,14 +1295,20 @@ app.post("/api/plans/purchase", async (req, res) => {
     const newTotalPurchased = Number(user.total_purchased_posts || 0) + Number(plan.post_count || 0);
     const newTotalSpent = Number(user.total_spent_kes || 0) + Number(plan.price_kes || 0);
 
-    await db.execute({
-      sql: "UPDATE users SET paid_post_credits = ?, total_purchased_posts = ?, total_spent_kes = ? WHERE id = ?",
-      args: [newCredits, newTotalPurchased, newTotalSpent, user.id],
-    });
+    await db.batch([
+      {
+        sql: "UPDATE users SET paid_post_credits = ?, total_purchased_posts = ?, total_spent_kes = ? WHERE id = ?",
+        args: [newCredits, newTotalPurchased, newTotalSpent, user.id],
+      },
+      {
+        sql: "INSERT INTO seller_post_credit_lots (id, seller_id, remaining_posts, duration_days, created_at) VALUES (?, ?, ?, ?, ?)",
+        args: [crypto.randomUUID(), user.id, Number(plan.post_count), Math.max(1, Number(plan.duration_days || 70)), new Date().toISOString()],
+      },
+    ], "write");
 
     await addSellerNotification(
       user.id,
-      `Purchased plan "${plan.name}" (+${plan.post_count} post credits for KES ${plan.price_kes}). Paid posts run for 70 days once published.`
+      `Purchased plan "${plan.name}" (+${plan.post_count} post credits for KES ${plan.price_kes}). Each post runs for ${plan.duration_days} days after approval.`
     );
 
     await addPaymentNotification({
@@ -1226,9 +1316,9 @@ app.post("/api/plans/purchase", async (req, res) => {
       payerName: user.name,
       payerPhone: payer_phone || user.whatsapp_phone,
       payerEmail: user.email,
-      purpose: `Post Plan: ${plan.name} (+${plan.post_count} posts, 70d lifetime)`,
+      purpose: `Post Plan: ${plan.name} (+${plan.post_count} posts, ${plan.duration_days}-day lifetime)`,
       amountKes: plan.price_kes,
-      paymentRef,
+      paymentRef: payment_ref,
     });
 
     const updatedRes = await db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [user.id] });
@@ -1449,20 +1539,22 @@ app.post("/api/listings", async (req, res) => {
     const paidCredits = Number(user.paid_post_credits || 0);
 
     let usedPaidCredit = false;
-    if (freeUsed < 6) {
+    let expiryDays = 14;
+    if (freeUsed < 5) {
       await db.execute({
         sql: "UPDATE users SET free_posts_used = ? WHERE id = ?",
         args: [freeUsed + 1, user.id],
       });
     } else if (paidCredits > 0) {
+      const creditDuration = await consumePaidPostCredit(user.id, paidCredits);
+      if (creditDuration === null) {
+        return res.status(409).json({ error: "Your post credits changed. Refresh your seller account and try again." });
+      }
       usedPaidCredit = true;
-      await db.execute({
-        sql: "UPDATE users SET paid_post_credits = ? WHERE id = ?",
-        args: [paidCredits - 1, user.id],
-      });
+      expiryDays = creditDuration;
     } else {
       return res.status(402).json({
-        error: "You have used all 6 free posts. Purchase a post plan to continue posting.",
+        error: "You have used all 5 free posts. Purchase a post plan to continue posting.",
         needs_plan: true,
       });
     }
@@ -1477,8 +1569,8 @@ app.post("/api/listings", async (req, res) => {
          vehicle_type, condition_type, brand, model, body_type, year, reg_number, fuel_type,
          transmission, drive_type, air_con, engine_cc, mileage_km,
          part_name, part_make, part_model, year_from, year_to, part_condition, part_authenticity,
-         price_kes, negotiable, town, description, status, is_paid_post, published_at, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, NULL, ?, ?)`,
+         price_kes, negotiable, town, description, status, is_paid_post, expiry_days, published_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?, NULL, ?, ?)`,
       args: [
         id,
         user.id,
@@ -1513,6 +1605,7 @@ app.post("/api/listings", async (req, res) => {
         optionalText(payload.town) || "Nakuru",
         String(payload.description).trim(),
         usedPaidCredit ? 1 : 0,
+        expiryDays,
         nowIso,
         nowIso,
       ],
@@ -1528,8 +1621,8 @@ app.post("/api/listings", async (req, res) => {
     await addSellerNotification(
       user.id,
       usedPaidCredit
-        ? `Deducted 1 paid post credit for "${title}" (pending Admin approval; runs for 70 days once published).`
-        : `Used 1 free post slot (${freeUsed + 1}/6) for "${title}" (pending Admin approval).`
+        ? `Deducted 1 paid post credit for "${title}" (pending Admin approval; runs for ${expiryDays} days after approval).`
+        : `Used 1 free post slot (${freeUsed + 1}/5) for "${title}" (pending Admin approval; runs for 14 days after approval).`
     );
 
     const createdRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [id] });
@@ -1538,6 +1631,60 @@ app.post("/api/listings", async (req, res) => {
       message: "Post submitted and sent to Admin for approval.",
       listing: rowToObj(createdRes),
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/listings/:id/repost", async (req, res) => {
+  try {
+    await syncExpiredListings();
+    const listingRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] });
+    const listing = rowToObj(listingRes);
+    if (!listing) return res.status(404).json({ error: "Expired post not found." });
+    if (!req.body?.seller_id || listing.seller_id !== req.body.seller_id) {
+      return res.status(403).json({ error: "You can only repost your own post." });
+    }
+    if (!canRepostExpiredListing(listing)) {
+      return res.status(410).json({ error: "The two-week repost period has ended. This post will be removed automatically." });
+    }
+    const userRes = await db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [listing.seller_id] });
+    const user = rowToObj(userRes);
+    if (!user) return res.status(404).json({ error: "Seller account not found." });
+    if (Number(user.is_suspended)) {
+      return res.status(403).json({ error: "Your seller account is suspended. You can only request a review." });
+    }
+
+    const durationDays = await consumePaidPostCredit(user.id, Number(user.paid_post_credits || 0));
+    if (durationDays === null) {
+      return res.status(402).json({ error: "Reposting requires one purchased post credit. Buy a post plan to continue." });
+    }
+
+    const nowIso = new Date().toISOString();
+    const update = await db.execute({
+      sql: `UPDATE listings
+        SET status = 'pending_approval', is_paid_post = 1, expiry_days = ?, published_at = NULL,
+            expired_at = NULL, priority_amount_kes = 0, priority_date = NULL,
+            rejection_reason = NULL, updated_at = ?
+        WHERE id = ? AND seller_id = ? AND status = 'expired' AND expired_at > ?`,
+      args: [
+        durationDays,
+        nowIso,
+        listing.id,
+        user.id,
+        new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString(),
+      ],
+    });
+    if (!Number(update.rowsAffected)) {
+      return res.status(409).json({ error: "This post can no longer be reposted. Refresh your seller account." });
+    }
+
+    await addSellerNotification(
+      user.id,
+      `Repost requested for "${listing.title}". One purchased post credit was used; the post is pending Admin approval and will run for ${durationDays} days after approval.`
+    );
+    const updatedRes = await db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [listing.id] });
+    res.json({ message: "Post submitted for approval using one purchased post credit.", listing: rowToObj(updatedRes) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1657,17 +1804,14 @@ app.get("/api/priority/leaderboard", async (req, res) => {
       .filter((l) => String(l.priority_date || "").slice(0, 10) === todayStr && Number(l.priority_amount_kes || 0) > 0)
       .sort((a, b) => Number(b.priority_amount_kes) - Number(a.priority_amount_kes));
 
-    const maxSlots = 20;
-    const usedSlots = Math.min(maxSlots, activeToday.length);
     const topBid = activeToday[0] ? Number(activeToday[0].priority_amount_kes) : 0;
     const recommendedForTop1 = topBid >= baseFee ? topBid + 50 : baseFee;
 
     res.json({
       baseFee,
-      maxSlots,
-      usedSlots,
+      sponsoredToday: activeToday.length,
       recommendedForTop1,
-      leaderboard: activeToday.slice(0, maxSlots),
+      leaderboard: activeToday,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1682,10 +1826,9 @@ app.post("/api/listings/:id/prioritize", async (req, res) => {
       return res.status(400).json({ error: "Valid priority amount in KES is required." });
     }
 
-    const [settingsRes, listRes, allActiveRes, priorityPlanRes] = await Promise.all([
+    const [settingsRes, listRes, priorityPlanRes] = await Promise.all([
       db.execute("SELECT * FROM platform_settings"),
       db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] }),
-      db.execute("SELECT id, priority_date, priority_amount_kes FROM listings WHERE status = 'active'"),
       priority_plan_id
         ? db.execute({ sql: "SELECT * FROM priority_plans WHERE id = ?", args: [priority_plan_id] })
         : Promise.resolve(null),
@@ -1708,20 +1851,14 @@ app.post("/api/listings/:id/prioritize", async (req, res) => {
     }
 
     const minimumFee = priorityPlan ? Number(priorityPlan.price_kes) : baseFee;
+    if (priorityPlan && amount !== minimumFee) {
+      return res.status(400).json({ error: "The selected priority plan must be paid at its listed price." });
+    }
     if (amount < minimumFee) {
       return res.status(400).json({ error: `Minimum fee for this priority plan is KES ${minimumFee}.` });
     }
 
     const todayStr = todayKenyaDate();
-    const todaySponsored = rowsToArray(allActiveRes).filter(
-      (x) => String(x.priority_date || "").slice(0, 10) === todayStr && Number(x.priority_amount_kes || 0) > 0
-    );
-
-    const alreadySponsoredToday = todaySponsored.some((x) => x.id === listing.id);
-    if (!alreadySponsoredToday && todaySponsored.length >= 20) {
-      return res.status(409).json({ error: "All 20 daily sponsored priority slots are full for today." });
-    }
-
     await db.execute({
       sql: "UPDATE listings SET priority_amount_kes = ?, priority_date = ?, updated_at = ? WHERE id = ?",
       args: [amount, todayStr, new Date().toISOString(), listing.id],
@@ -1729,7 +1866,7 @@ app.post("/api/listings/:id/prioritize", async (req, res) => {
 
     await addSellerNotification(
       listing.seller_id,
-      `Prioritized "${listing.title}" for today with KES ${amount}${priorityPlan ? ` using ${priorityPlan.name}` : ""}. Higher amounts appear higher in the Top 20.`
+      `Prioritized "${listing.title}" for today with KES ${amount}${priorityPlan ? ` using ${priorityPlan.name}` : ""}. Higher amounts appear higher in the sponsored listings.`
     );
 
     await addPaymentNotification({
@@ -2040,6 +2177,7 @@ app.get("/api/admin/overview", requireAdmin, async (req, res) => {
       ...l,
       cover_photo: coverMap[l.id] || "",
       days_remaining: computeDaysRemaining(l),
+      can_repost: canRepostExpiredListing(l),
     }));
 
     const safeUsers = rowsToArray(usersRes).map(sanitizeUser);
@@ -2287,7 +2425,13 @@ app.post("/api/admin/users/:id/gift-posts", requireAdmin, async (req, res) => {
     if (!user) return res.status(404).json({ error: "User not found." });
 
     const newCredits = Math.max(0, Number(user.paid_post_credits || 0) + count);
-    await db.execute({ sql: "UPDATE users SET paid_post_credits = ? WHERE id = ?", args: [newCredits, user.id] });
+    await db.batch([
+      { sql: "UPDATE users SET paid_post_credits = ? WHERE id = ?", args: [newCredits, user.id] },
+      {
+        sql: "INSERT INTO seller_post_credit_lots (id, seller_id, remaining_posts, duration_days, created_at) VALUES (?, ?, ?, 70, ?)",
+        args: [crypto.randomUUID(), user.id, count, new Date().toISOString()],
+      },
+    ], "write");
     await addSellerNotification(user.id, `Admin gifted ${count} post credit(s) to your account.`);
     res.json({ message: "Gifted posts updated." });
   } catch (err) {
@@ -2388,11 +2532,19 @@ app.delete("/api/admin/priority-plans/:id", requireAdmin, async (req, res) => {
 
 app.put("/api/admin/plans/:id", requireAdmin, async (req, res) => {
   try {
-    const { name, post_count, price_kes } = req.body;
-    await db.execute({
-      sql: "UPDATE post_plans SET name = ?, post_count = ?, price_kes = ? WHERE id = ?",
-      args: [name, Number(post_count), Number(price_kes), req.params.id],
+    const name = String(req.body?.name || "").trim();
+    const postCount = Number(req.body?.post_count);
+    const price = Number(req.body?.price_kes);
+    const durationDays = Number(req.body?.duration_days);
+    if (!name || name.length > 80 || !Number.isSafeInteger(postCount) || postCount < 1 ||
+        !Number.isSafeInteger(price) || price < 1 || !Number.isSafeInteger(durationDays) || durationDays < 1) {
+      return res.status(400).json({ error: "Enter a plan name, post count, price, and expiry duration in whole days." });
+    }
+    const result = await db.execute({
+      sql: "UPDATE post_plans SET name = ?, post_count = ?, price_kes = ?, duration_days = ? WHERE id = ?",
+      args: [name, postCount, price, durationDays, req.params.id],
     });
+    if (!Number(result.rowsAffected)) return res.status(404).json({ error: "Post plan not found." });
     res.json({ message: "Plan updated." });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2401,10 +2553,17 @@ app.put("/api/admin/plans/:id", requireAdmin, async (req, res) => {
 
 app.post("/api/admin/plans", requireAdmin, async (req, res) => {
   try {
-    const { name, post_count, price_kes } = req.body;
+    const name = String(req.body?.name || "").trim();
+    const postCount = Number(req.body?.post_count);
+    const price = Number(req.body?.price_kes);
+    const durationDays = Number(req.body?.duration_days);
+    if (!name || name.length > 80 || !Number.isSafeInteger(postCount) || postCount < 1 ||
+        !Number.isSafeInteger(price) || price < 1 || !Number.isSafeInteger(durationDays) || durationDays < 1) {
+      return res.status(400).json({ error: "Enter a plan name, post count, price, and expiry duration in whole days." });
+    }
     await db.execute({
-      sql: "INSERT INTO post_plans (id, name, post_count, price_kes) VALUES (?, ?, ?, ?)",
-      args: [crypto.randomUUID(), name, Number(post_count), Number(price_kes)],
+      sql: "INSERT INTO post_plans (id, name, post_count, price_kes, duration_days) VALUES (?, ?, ?, ?, ?)",
+      args: [crypto.randomUUID(), name, postCount, price, durationDays],
     });
     res.json({ message: "Plan added." });
   } catch (err) {

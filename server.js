@@ -1,16 +1,10 @@
 
 
-
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
-import path from "path";
-import { fileURLToPath } from "url";
 import { createClient } from "@libsql/client";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -34,19 +28,25 @@ const FIREBASE_SIGNING_KEYS_URL = "https://www.googleapis.com/service_accounts/v
 let firebaseSigningKeys = null;
 let firebaseSigningKeysExpiresAt = 0;
 
-if (!TURSO_DATABASE_URL) {
-  console.error("Missing TURSO_DATABASE_URL environment variable.");
-  process.exit(1);
-}
-
-const db = createClient({
-  url: TURSO_DATABASE_URL,
-  authToken: TURSO_AUTH_TOKEN,
-});
+const db = TURSO_DATABASE_URL
+  ? createClient({ url: TURSO_DATABASE_URL, authToken: TURSO_AUTH_TOKEN })
+  : null;
+let databaseInitialization;
 
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
-app.use(express.static(path.join(__dirname, "public")));
+app.use("/api", async (req, res, next) => {
+  if (req.path === "/config") return next();
+  if (!db) return res.status(503).json({ error: "Database unavailable: TURSO_DATABASE_URL is not configured." });
+  try {
+    const ready = await databaseInitialization;
+    if (!ready) return res.status(503).json({ error: "Database unavailable. Check the Turso connection and configuration." });
+    return next();
+  } catch (error) {
+    console.error("Database initialization failed:", error);
+    return res.status(503).json({ error: "Database unavailable. Check the Turso connection and configuration." });
+  }
+});
 
 app.get("/api/config", (req, res) => {
   res.json({ firebase: FIREBASE_CONFIG });
@@ -73,6 +73,28 @@ function rowsToArray(result) {
     });
     return obj;
   });
+}
+
+function makeAccountNotifications(notifications, payments) {
+  return [
+    ...notifications.map((notification) => ({
+      id: notification.id,
+      type: "account",
+      seller_id: notification.seller_id,
+      seller_name: notification.seller_name || "",
+      message: notification.message,
+      created_at: notification.created_at,
+    })),
+    ...payments.map((payment) => ({
+      id: payment.id,
+      type: "payment",
+      seller_id: payment.seller_id,
+      seller_name: payment.payer_name || payment.seller_name || "",
+      message: `${payment.purpose || "Payment confirmed"} — KES ${Number(payment.amount_kes || 0).toLocaleString()}`,
+      amount_kes: Number(payment.amount_kes || 0),
+      created_at: payment.created_at,
+    })),
+  ].sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
 }
 
 async function initDb() {
@@ -120,6 +142,11 @@ async function initDb() {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         post_count INTEGER NOT NULL,
+        price_kes INTEGER NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS priority_plans (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
         price_kes INTEGER NOT NULL
       )`,
       `CREATE TABLE IF NOT EXISTS platform_settings (
@@ -392,6 +419,17 @@ async function initDb() {
     await db.execute({
       sql: "INSERT INTO platform_settings (key, value) VALUES (?, ?)",
       args: ["base_priority_price_kes", "300"],
+    });
+  }
+
+  const priorityPlansCount = await db.execute("SELECT COUNT(*) AS cnt FROM priority_plans");
+  if (Number(priorityPlansCount.rows[0]?.[0] || 0) === 0) {
+    const priorityPrice = await db.execute({
+      sql: "SELECT value FROM platform_settings WHERE key = 'base_priority_price_kes'",
+    });
+    await db.execute({
+      sql: "INSERT INTO priority_plans (id, name, price_kes) VALUES (?, ?, ?)",
+      args: ["priority-standard", "Standard Priority (24 hours)", Number(priorityPrice.rows[0]?.[0] || 300)],
     });
   }
 
@@ -777,10 +815,12 @@ function sanitizeUser(u) {
   return copy;
 }
 
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
+app.get("/health", async (req, res) => {
+  const databaseReady = await databaseInitialization;
+  res.status(databaseReady ? 200 : 503).json({
+    ok: Boolean(databaseReady),
     service: "Wariara Cars Central Rift API (Turso)",
+    databaseConfigured: Boolean(TURSO_DATABASE_URL),
     emailjsConfigured: Boolean(
       EMAILJS_PUBLIC_KEY && EMAILJS_PRIVATE_KEY && EMAILJS_SERVICE_ID && EMAILJS_TEMPLATE_ID
     ),
@@ -791,9 +831,10 @@ app.get("/health", (req, res) => {
 
 app.get("/api/meta", async (req, res) => {
   try {
-    const [catalogRes, plansRes, settingsRes] = await Promise.all([
+    const [catalogRes, plansRes, priorityPlansRes, settingsRes] = await Promise.all([
       db.execute("SELECT * FROM vehicle_catalog ORDER BY brand ASC"),
       db.execute("SELECT * FROM post_plans ORDER BY price_kes ASC"),
+      db.execute("SELECT * FROM priority_plans ORDER BY price_kes ASC"),
       db.execute("SELECT * FROM platform_settings"),
     ]);
 
@@ -805,6 +846,7 @@ app.get("/api/meta", async (req, res) => {
     res.json({
       catalog: rowsToArray(catalogRes),
       plans: rowsToArray(plansRes),
+      priorityPlans: rowsToArray(priorityPlansRes),
       settings,
     });
   } catch (err) {
@@ -1041,18 +1083,21 @@ app.get("/api/sellers/:id/notifications", async (req, res) => {
   try {
     const [notifRes, paymentsRes] = await Promise.all([
       db.execute({
-        sql: "SELECT * FROM seller_notifications WHERE seller_id = ? ORDER BY created_at DESC LIMIT 50",
-        args: [req.params.id],
+        sql: "SELECT * FROM seller_notifications WHERE seller_id = ? OR user_id = ? ORDER BY created_at DESC LIMIT 50",
+        args: [req.params.id, req.params.id],
       }),
       db.execute({
-        sql: `SELECT id, purpose, amount_kes, created_at
+        sql: `SELECT id, purpose, amount_kes, created_at, seller_id, payer_name
           FROM payment_notifications WHERE seller_id = ? ORDER BY created_at DESC LIMIT 50`,
         args: [req.params.id],
       }),
     ]);
+    const notifications = rowsToArray(notifRes);
+    const payments = rowsToArray(paymentsRes);
     res.json({
-      notifications: rowsToArray(notifRes),
-      paymentNotifications: rowsToArray(paymentsRes),
+      notifications,
+      paymentNotifications: payments,
+      accountNotifications: makeAccountNotifications(notifications, payments),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1597,16 +1642,19 @@ app.get("/api/priority/leaderboard", async (req, res) => {
 
 app.post("/api/listings/:id/prioritize", async (req, res) => {
   try {
-    const { amount_kes, payment_ref = "", payer_phone = "" } = req.body;
+    const { amount_kes, payment_ref = "", payer_phone = "", priority_plan_id } = req.body;
     const amount = Number(amount_kes);
     if (!amount || amount <= 0) {
       return res.status(400).json({ error: "Valid priority amount in KES is required." });
     }
 
-    const [settingsRes, listRes, allActiveRes] = await Promise.all([
+    const [settingsRes, listRes, allActiveRes, priorityPlanRes] = await Promise.all([
       db.execute("SELECT * FROM platform_settings"),
       db.execute({ sql: "SELECT * FROM listings WHERE id = ?", args: [req.params.id] }),
       db.execute("SELECT id, priority_date, priority_amount_kes FROM listings WHERE status = 'active'"),
+      priority_plan_id
+        ? db.execute({ sql: "SELECT * FROM priority_plans WHERE id = ?", args: [priority_plan_id] })
+        : Promise.resolve(null),
     ]);
 
     const listing = rowToObj(listRes);
@@ -1620,9 +1668,14 @@ app.post("/api/listings/:id/prioritize", async (req, res) => {
     const settings = {};
     for (const r of rowsToArray(settingsRes)) settings[r.key] = r.value;
     const baseFee = Number(settings.base_priority_price_kes || 300);
+    const priorityPlan = priorityPlanRes ? rowToObj(priorityPlanRes) : null;
+    if (priority_plan_id && !priorityPlan) {
+      return res.status(400).json({ error: "The selected priority plan is no longer available. Refresh and try again." });
+    }
 
-    if (amount < baseFee) {
-      return res.status(400).json({ error: `Minimum priority fee is KES ${baseFee}.` });
+    const minimumFee = priorityPlan ? Number(priorityPlan.price_kes) : baseFee;
+    if (amount < minimumFee) {
+      return res.status(400).json({ error: `Minimum fee for this priority plan is KES ${minimumFee}.` });
     }
 
     const todayStr = todayKenyaDate();
@@ -1642,7 +1695,7 @@ app.post("/api/listings/:id/prioritize", async (req, res) => {
 
     await addSellerNotification(
       listing.seller_id,
-      `Prioritized "${listing.title}" for today with KES ${amount}. Higher amounts appear higher in the Top 20.`
+      `Prioritized "${listing.title}" for today with KES ${amount}${priorityPlan ? ` using ${priorityPlan.name}` : ""}. Higher amounts appear higher in the Top 20.`
     );
 
     await addPaymentNotification({
@@ -1922,12 +1975,16 @@ app.get("/api/admin/overview", requireAdmin, async (req, res) => {
   try {
     await syncExpiredListings();
 
-    const [listingsRes, usersRes, plansRes, settingsRes, payNotifsRes] = await Promise.all([
+    const [listingsRes, usersRes, plansRes, priorityPlansRes, settingsRes, payNotifsRes, accountNotifsRes] = await Promise.all([
       db.execute("SELECT * FROM listings ORDER BY created_at DESC"),
       db.execute("SELECT * FROM users ORDER BY created_at DESC"),
       db.execute("SELECT * FROM post_plans ORDER BY price_kes ASC"),
+      db.execute("SELECT * FROM priority_plans ORDER BY price_kes ASC"),
       db.execute("SELECT * FROM platform_settings"),
       db.execute("SELECT * FROM payment_notifications ORDER BY created_at DESC LIMIT 100"),
+      db.execute(`SELECT sn.id, COALESCE(sn.seller_id, sn.user_id) AS seller_id, sn.message, sn.created_at, u.name AS seller_name
+        FROM seller_notifications sn LEFT JOIN users u ON u.id = COALESCE(sn.seller_id, sn.user_id)
+        ORDER BY sn.created_at DESC LIMIT 100`),
     ]);
 
     const listings = rowsToArray(listingsRes);
@@ -1956,12 +2013,16 @@ app.get("/api/admin/overview", requireAdmin, async (req, res) => {
     const settings = {};
     for (const r of rowsToArray(settingsRes)) settings[r.key] = r.value;
 
+    const paymentNotifications = rowsToArray(payNotifsRes);
+    const accountNotifications = makeAccountNotifications(rowsToArray(accountNotifsRes), paymentNotifications);
     res.json({
       listings: enrichedListings,
       users: safeUsers,
       plans: rowsToArray(plansRes),
+      priorityPlans: rowsToArray(priorityPlansRes),
       settings,
-      paymentNotifications: rowsToArray(payNotifsRes),
+      accountNotifications,
+      paymentNotifications,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2233,11 +2294,59 @@ app.post("/api/admin/users/:id/suspension", requireAdmin, async (req, res) => {
 app.post("/api/admin/settings", requireAdmin, async (req, res) => {
   try {
     const { base_priority_price_kes } = req.body;
+    if (!Number.isSafeInteger(Number(base_priority_price_kes)) || Number(base_priority_price_kes) < 1) {
+      return res.status(400).json({ error: "Priority base price must be a positive whole number." });
+    }
     await db.execute({
       sql: "INSERT INTO platform_settings (key, value) VALUES ('base_priority_price_kes', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       args: [String(Number(base_priority_price_kes))],
     });
     res.json({ message: "Saved." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/priority-plans", requireAdmin, async (req, res) => {
+  try {
+    const name = String(req.body?.name || "").trim();
+    const price = Number(req.body?.price_kes);
+    if (!name || name.length > 80 || !Number.isSafeInteger(price) || price < 1) {
+      return res.status(400).json({ error: "Enter a plan name and a positive whole-number price." });
+    }
+    await db.execute({
+      sql: "INSERT INTO priority_plans (id, name, price_kes) VALUES (?, ?, ?)",
+      args: [crypto.randomUUID(), name, price],
+    });
+    res.json({ message: "Priority plan added." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/admin/priority-plans/:id", requireAdmin, async (req, res) => {
+  try {
+    const name = String(req.body?.name || "").trim();
+    const price = Number(req.body?.price_kes);
+    if (!name || name.length > 80 || !Number.isSafeInteger(price) || price < 1) {
+      return res.status(400).json({ error: "Enter a plan name and a positive whole-number price." });
+    }
+    const result = await db.execute({
+      sql: "UPDATE priority_plans SET name = ?, price_kes = ? WHERE id = ?",
+      args: [name, price, req.params.id],
+    });
+    if (!Number(result.rowsAffected)) return res.status(404).json({ error: "Priority plan not found." });
+    res.json({ message: "Priority plan updated." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/admin/priority-plans/:id", requireAdmin, async (req, res) => {
+  try {
+    const result = await db.execute({ sql: "DELETE FROM priority_plans WHERE id = ?", args: [req.params.id] });
+    if (!Number(result.rowsAffected)) return res.status(404).json({ error: "Priority plan not found." });
+    res.json({ message: "Priority plan deleted." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2282,13 +2391,32 @@ app.post("/api/admin/catalog", requireAdmin, async (req, res) => {
   }
 });
 
-initializeDatabaseWithRetry()
-  .then(() => {
+const isVercel = Boolean(process.env.VERCEL);
+if (!TURSO_DATABASE_URL) {
+  console.error("Missing TURSO_DATABASE_URL environment variable.");
+  databaseInitialization = Promise.resolve(false);
+} else {
+  databaseInitialization = initializeDatabaseWithRetry()
+    .then(() => true)
+    .catch((err) => {
+      console.error("Failed to initialize Turso database:", err);
+      return false;
+    });
+}
+
+if (!isVercel) {
+  databaseInitialization.then((ready) => {
+    if (!ready) {
+      process.exitCode = 1;
+      return;
+    }
     app.listen(PORT, () => {
       console.log(`Wariara Cars Central Rift API (Turso) running on port ${PORT}`);
     });
-  })
-  .catch((err) => {
-    console.error("Failed to initialize Turso database:", err);
-    process.exit(1);
   });
+}
+
+app.get("/", (req, res) => res.json({ service: "Wariara Cars API", api: "/api" }));
+app.use((req, res) => res.status(404).json({ error: "Not found." }));
+
+export default app;
